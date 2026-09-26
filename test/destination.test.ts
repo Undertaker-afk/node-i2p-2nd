@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { createDestinationKeys, encodeDestinationBase64, parseDestination } from '../src/router/protocol/destination.ts';
 import { createLeaseSet2, parseLeaseSet2, selectX25519Key, verifyLeaseSet2 } from '../src/router/protocol/leaseset.ts';
 import { wrapDestExistingSession, unwrapDestExistingSession, unwrapDestNewSession, unwrapDestNewSessionReply, wrapDestNewSession, wrapDestNewSessionReply } from '../src/router/crypto/ecies-dest.ts';
@@ -9,6 +12,11 @@ import { encodeDatabaseLookup, parseDatabaseLookup, encryptDatabaseLookupReply, 
 import { encodeDatabaseStoreLeaseSet2, parseDatabaseStore } from '../src/router/netdb/database-store.ts';
 import { HostsBook } from '../src/router/netdb/hosts.ts';
 import { I2NP_DATA } from '../src/router/streaming.ts';
+import { encryptAead } from '../src/router/crypto/x25519.ts';
+import { encodeDateTimeBlock, encodeGarlicCloveBlock, encodePaddingBlock } from '../src/router/tunnel/garlic.ts';
+import { DestinationSessionManager, type DestinationStream } from '../src/router/destination-session.ts';
+import { httpGetOverStream } from '../src/router/http-client.ts';
+import { loadOrCreateDestinationKeys } from '../src/router/destination-store.ts';
 
 function clove(destHash: Buffer, payload: Buffer) {
   return {
@@ -76,4 +84,71 @@ test('hosts book resolves i2p-projekt aliases and b32 names', () => {
   assert.ok(resolved?.destination);
   const imported = book.importHostsTxt('example.i2p=' + encodeDestinationBase64(dest!) + '\n');
   assert.equal(imported, 1);
+  assert.ok(book.get('notbob.i2p'));
+  assert.ok(book.get('identiguy.i2p'));
+  assert.ok(book.get('stats.i2p'));
+});
+
+test('encrypted lookup replies accept Garlic cloves as well as raw I2NP', () => {
+  const replyKey = randomBytes(32); const tag = randomBytes(8);
+  const inner = { type: 1, id: 9, expiration: Date.now() + 10_000, payload: randomBytes(8) };
+  const plaintext = Buffer.concat([
+    encodeDateTimeBlock(),
+    encodeGarlicCloveBlock({ delivery: { type: 'local' }, message: inner }),
+    encodePaddingBlock(0),
+  ]);
+  const body = Buffer.concat([tag, encryptAead(replyKey, Buffer.alloc(12), tag, plaintext)]);
+  const decrypted = decryptDatabaseLookupReply(body, replyKey, tag);
+  assert.equal(decrypted.type, 1);
+  assert.deepEqual(decrypted.payload, inner.payload);
+});
+
+test('destination sessions include LeaseSet2 in New Session and carry an HTTP GET', async () => {
+  let alice!: DestinationSessionManager;
+  const bob = new DestinationSessionManager({
+    sendGarlic: async message => { alice.handleGarlic(message); },
+  });
+  alice = new DestinationSessionManager({
+    sendGarlic: async message => { bob.handleGarlic(message); },
+  });
+  const aliceLease = { gatewayHash: randomBytes(32), tunnelId: 11, expiresAtSeconds: Math.floor(Date.now() / 1000) + 600 };
+  alice.createLeaseSet([aliceLease]);
+  let inbound: DestinationStream | undefined;
+  const seenLease = new Promise<void>(resolve => {
+    bob.on('leaseSet', ls => {
+      assert.deepEqual(ls.destinationHash, alice.local.destinationHash);
+      resolve();
+    });
+  });
+  bob.on('inboundStream', (stream, nsr, remote) => {
+    inbound = stream;
+    assert.equal(remote.tunnelId, 11);
+    assert.deepEqual(remote.gatewayHash, aliceLease.gatewayHash);
+    stream.on('data', (_payload: Buffer) => {
+      void stream.write(Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello')).then(() => stream.close());
+    });
+    alice.handleGarlic(nsr);
+  });
+  const stream = await alice.connect({
+    gatewayHash: randomBytes(32), tunnelId: 9,
+    encryptionPublicKey: bob.local.encryptionPublicKey,
+    destination: bob.local.destination, destinationHash: bob.local.destinationHash,
+  });
+  await seenLease;
+  assert.ok(inbound);
+  const response = await httpGetOverStream(stream, { host: 'bob.i2p', path: '/hosts.txt' });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.toString(), 'hello');
+});
+
+test('persists destination keys across reloads', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'i2p-dest-'));
+  const state = path.join(root, 'state');
+  try {
+    const first = await loadOrCreateDestinationKeys(state);
+    const reloaded = await loadOrCreateDestinationKeys(state);
+    assert.deepEqual(reloaded.destination, first.destination);
+    assert.deepEqual(reloaded.encryptionPublicKey, first.encryptionPublicKey);
+    assert.equal((await stat(path.join(state, 'destination.json'))).mode & 0o777, 0o600);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

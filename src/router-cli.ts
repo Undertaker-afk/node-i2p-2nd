@@ -2,12 +2,16 @@
 import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
+import { readFile, writeFile } from 'node:fs/promises';
 import { loadOrCreateRouterIdentity } from './router/identity-store.ts';
+import { loadOrCreateDestinationKeys } from './router/destination-store.ts';
 import { PersistentRouterInfoStore } from './router/netdb/persistent-store.ts';
 import { VerifiedRouterInfoStore } from './router/netdb/store.ts';
 import { createRouterInfoRecord, type RouterAddress } from './router/protocol/router-info.ts';
 import { NativeRouterNode } from './router/node.ts';
 import { createNativeSamServer } from './router/native-sam.ts';
+import { createNativeHttpProxy } from './router/native-proxy.ts';
+import { encodeDestinationBase64 } from './router/protocol/destination.ts';
 
 function usage(): string {
   return [
@@ -20,6 +24,9 @@ function usage(): string {
     '  --net-id <id>        I2P network ID (default: 2)',
     '  --max-transit-tunnels <n> Max active transit tunnels (default: 5000)',
     '  --max-concurrent-tunnel-builds <n> Concurrent short builds (default: 8)',
+    '  --proxy-host <host>  Native HTTP proxy bind host (default: 127.0.0.1)',
+    '  --proxy-port <port>  Native HTTP proxy port (default: 4444)',
+    '  --no-proxy            Do not start the native HTTP proxy',
     '  --no-transit          Decline new transit tunnel builds',
     '  --help                Show this help',
     '',
@@ -35,7 +42,7 @@ function parseArgs(argv: string[]): Map<string, string | true> {
     const equals = argument.indexOf('=');
     const key = equals < 0 ? argument.slice(2) : argument.slice(2, equals);
     if (!/^[a-z][a-z-]*$/.test(key) || result.has(key)) throw new Error(`Invalid or duplicate option: ${argument}`);
-    if (key === 'help' || key === 'no-transit') { result.set(key, true); continue; }
+    if (key === 'help' || key === 'no-transit' || key === 'no-proxy') { result.set(key, true); continue; }
     const value = equals < 0 ? argv[++index] : argument.slice(equals + 1);
     if (!value || value.startsWith('--')) throw new Error(`Option --${key} requires a value`);
     result.set(key, value);
@@ -65,6 +72,7 @@ async function main(): Promise<void> {
   const stateDir = path.resolve(stateValue);
 
   const identity = await loadOrCreateRouterIdentity(stateDir);
+  const destination = await loadOrCreateDestinationKeys(stateDir);
   const persistent = await PersistentRouterInfoStore.open(path.join(stateDir, 'netDb'), { expectedNetId: String(networkId) });
   const netDb = new VerifiedRouterInfoStore(10_000, String(networkId));
   for (const info of persistent.all()) netDb.store(info);
@@ -81,7 +89,7 @@ async function main(): Promise<void> {
   ]));
   const nodeOptions = {
     identity, routerInfo, netDb, host: bindHost, port, publishedIv, networkId, maxTransitTunnels, maxConcurrentTunnelBuilds,
-    acceptTransitTunnels: !args.has('no-transit'),
+    acceptTransitTunnels: !args.has('no-transit'), destination,
   };
   const node = netDb.size < 10
     ? await NativeRouterNode.createFromReseed(nodeOptions)
@@ -94,22 +102,48 @@ async function main(): Promise<void> {
   node.on('bootstrapError', error => process.stderr.write(`peer bootstrap error: ${String(error)}\n`));
   node.on('netDbError', error => process.stderr.write(`netDb protocol error: ${String(error)}\n`));
   node.on('peer', (peer, _connection, direction) => process.stdout.write(`NTCP2 ${direction} peer ${peer ? Buffer.from(peer).toString('hex') : 'accepted'}\n`));
+  const hostsPath = path.join(stateDir, 'hosts.txt');
+  try {
+    const imported = node.hosts.importHostsTxt(await readFile(hostsPath, 'utf8'));
+    process.stdout.write(`Loaded ${imported} additional hosts.txt entries from ${hostsPath}\n`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') process.stderr.write(`hosts.txt load: ${String(error)}\n`);
+  }
   const bound = await node.start();
   process.stdout.write(`Native TypeScript I2P router listening on ${bound.address}:${bound.port}; identity ${identity.identityHash.toString('base64')}\n`);
-  process.stdout.write('NTCP2, ECIES short tunnels, Garlic-N, LeaseSet2, and destination streaming are enabled.\n');
+  process.stdout.write(`Local destination ${encodeDestinationBase64(destination.destination)}\n`);
+  process.stdout.write('NTCP2, ECIES short tunnels, Garlic-N, LeaseSet2, destination streaming, and address-book subscriptions are enabled.\n');
   const sam = createNativeSamServer(node, { host: '127.0.0.1', port: 7656 });
   const samAddr = await sam.listen();
   process.stdout.write(`Native SAM v3 listening on ${samAddr.address}:${samAddr.port}\n`);
+  const proxyHost = args.get('proxy-host') ?? '127.0.0.1';
+  const proxyPort = Number(args.get('proxy-port') ?? 4444);
+  if (typeof proxyHost !== 'string' || !proxyHost.trim()) throw new Error('--proxy-host must not be empty');
+  if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535) throw new RangeError('--proxy-port must be 1..65535');
+  const proxy = args.has('no-proxy') ? undefined : createNativeHttpProxy({ node, host: proxyHost, port: proxyPort });
+  if (proxy) {
+    await proxy.listen();
+    process.stdout.write(`Native HTTP proxy listening on ${proxyHost}:${proxyPort} (http://*.i2p only)\n`);
+  }
   node.on('bootstrapComplete', stats => {
     process.stdout.write(`Peer bootstrap complete: ${stats.connected} connected, ${stats.attempted} attempted\n`);
-    void node.tunnelPool.maintain().then(() => {
+    void node.tunnelPool.maintain().then(async () => {
       process.stdout.write(`Tunnel pool ready: ${node.tunnelPool.inbound.length} inbound, ${node.tunnelPool.outbound.length} outbound\n`);
+      await node.publishLocalLeaseSet();
+      process.stdout.write('Published local LeaseSet2 to floodfills\n');
+      const results = await node.refreshAddressBook();
+      for (const result of results) {
+        if (result.error) process.stderr.write(`address book ${result.host}${result.path}: ${result.error}\n`);
+        else process.stdout.write(`address book ${result.host}${result.path}: imported ${result.imported} names (${node.hosts.size} total)\n`);
+      }
+      await writeFile(hostsPath, node.hosts.exportHostsTxt());
     }).catch(error => process.stderr.write(`tunnel pool: ${String(error)}\n`));
   });
 
   let stopping = false;
   const shutdown = async () => {
     if (stopping) return; stopping = true;
+    if (proxy) await proxy.close();
     await sam.close(); await node.stop(); process.exitCode = 0;
   };
   process.once('SIGINT', () => { void shutdown().catch(error => { process.stderr.write(`${String(error)}\n`); process.exitCode = 1; }); });

@@ -16,12 +16,13 @@ import { TransitTunnelService } from './tunnel/transit.ts';
 import { ShortTunnelBuildCreator, type BuiltInboundTunnel, type BuiltOutboundTunnel, type ShortBuildHop, type ShortBuildReplyTunnel } from './tunnel/builder.ts';
 import { TunnelPool } from './tunnel/pool.ts';
 import { DestinationSessionManager, leaseSetToRemote, type RemoteLease } from './destination-session.ts';
-import { createDestinationKeys, parseDestination } from './protocol/destination.ts';
+import { createDestinationKeys, parseDestination, type DestinationKeys } from './protocol/destination.ts';
 import type { LeaseSet2 } from './protocol/leaseset.ts';
 import { encodeDatabaseLookup, decryptDatabaseLookupReply } from './netdb/messages.ts';
-import { parseDatabaseStore } from './netdb/database-store.ts';
+import { encodeDatabaseStoreLeaseSet2, parseDatabaseStore } from './netdb/database-store.ts';
 import { wrapEciesRouterGarlicMessage } from './tunnel/garlic.ts';
-import { HostsBook } from './netdb/hosts.ts';
+import { ADDRESS_BOOK_SUBSCRIPTIONS, HostsBook } from './netdb/hosts.ts';
+import { httpGetOverStream } from './http-client.ts';
 import { encodeTunnelGatewayPayload, encodeTunnelDataPayload } from './tunnel/messages.ts';
 import { buildTunnelMessageFragments, type TunnelDelivery } from './tunnel/fragments.ts';
 import { preprocessOutboundTunnelMessage } from './tunnel/data.ts';
@@ -44,6 +45,7 @@ export type NativeRouterNodeOptions = {
   maxTransitTunnels?: number;
   maxConcurrentTunnelBuilds?: number;
   acceptTransitTunnels?: boolean;
+  destination?: DestinationKeys;
 };
 
 /** Small direct-peer node that composes NTCP2, verified RouterInfo storage, and I2NP netDb handling. */
@@ -137,13 +139,14 @@ export class NativeRouterNode extends EventEmitter {
     if (!Number.isSafeInteger(this.targetOutboundPeers) || this.targetOutboundPeers < 0 || this.targetOutboundPeers > this.maxOutboundConnections) throw new RangeError('targetOutboundPeers must be between 0 and maxOutboundConnections');
     if (!Number.isSafeInteger(this.routerInfoRefreshMs) || (this.routerInfoRefreshMs !== 0 && (this.routerInfoRefreshMs < 60_000 || this.routerInfoRefreshMs > 86_400_000))) throw new RangeError('routerInfoRefreshMs must be 0 or 60000..86400000 ms');
     this.destinations = new DestinationSessionManager({
-      local: createDestinationKeys(),
+      local: options.destination ?? createDestinationKeys(),
       sendGarlic: async (message, remote) => {
         await this.sendThroughOutboundTunnel(this.tunnelPool.currentOutbound(), message, {
           type: 'tunnel', gatewayHash: remote.gatewayHash, tunnelId: remote.tunnelId,
         });
       },
     });
+    this.destinations.on('leaseSet', (ls: LeaseSet2) => this.cacheLeaseSet(ls));
     this.destinations.on('inboundStream', (_stream, nsr, remote) => {
       if (remote.gatewayHash.equals(Buffer.alloc(32))) return;
       void this.sendThroughOutboundTunnel(this.tunnelPool.currentOutbound(), nsr, {
@@ -286,7 +289,8 @@ export class NativeRouterNode extends EventEmitter {
     });
   }
 
-  selectFloodfill(target: Buffer): Buffer {
+  selectFloodfills(target: Buffer, count = 3): Buffer[] {
+    if (!Number.isInteger(count) || count < 1 || count > 16) throw new RangeError('Floodfill count must be 1..16');
     const floodfills = this.netDb.all().filter(info => (info.options.get('caps') ?? '').includes('f') && !info.identityHash.equals(this.identity.identityHash));
     const pool = floodfills.length ? floodfills : this.netDb.all().filter(info => !info.identityHash.equals(this.identity.identityHash));
     if (!pool.length) throw new Error('No floodfill or peer is available for a netDb lookup');
@@ -298,7 +302,11 @@ export class NativeRouterNode extends EventEmitter {
       }
       return 0;
     });
-    return Buffer.from(pool[0]!.identityHash);
+    return pool.slice(0, Math.min(count, pool.length)).map(info => Buffer.from(info.identityHash));
+  }
+
+  selectFloodfill(target: Buffer): Buffer {
+    return this.selectFloodfills(target, 1)[0]!;
   }
 
   async buildInboundTunnel(pathIdentityHashes: readonly Buffer[], outbound?: BuiltOutboundTunnel): Promise<BuiltInboundTunnel> {
@@ -344,7 +352,7 @@ export class NativeRouterNode extends EventEmitter {
     });
     const floodfill = this.selectFloodfill(destinationHash);
     const lookup: I2npMessage = { type: 2, id: randomInt(1, 0x1_0000_0000), expiration: Date.now() + 60_000, payload };
-    await this.sendThroughOutboundTunnel(outbound, lookup, { type: 'router', identityHash: floodfill });
+    await this.sendToFloodfill(outbound, floodfill, lookup);
     return new Promise<LeaseSet2>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingLookups.delete(replyTag.toString('hex'));
@@ -419,6 +427,62 @@ export class NativeRouterNode extends EventEmitter {
     } finally { for (const frame of frames) frame.fill(0); }
   }
 
+  async publishLocalLeaseSet(): Promise<Buffer> {
+    if (!this.isRunning) throw new Error('Router node is not running');
+    const inbound = this.tunnelPool.inbound;
+    if (!inbound.length) throw new Error('Cannot publish a LeaseSet2 without an inbound tunnel');
+    const now = Math.floor(Date.now() / 1000);
+    const leases = inbound.map(tunnel => ({
+      gatewayHash: Buffer.from(tunnel.gatewayIdentityHash),
+      tunnelId: tunnel.gatewayTunnelId,
+      expiresAtSeconds: Math.max(now + 60, Math.floor(tunnel.expiresAt / 1000)),
+    }));
+    const encoded = this.destinations.createLeaseSet(leases);
+    const parsed = parseDatabaseStore(encodeDatabaseStoreLeaseSet2(encoded));
+    if (parsed.kind !== 'leaseSet2') throw new Error('Published record was not a LeaseSet2');
+    this.cacheLeaseSet(parsed.record.leaseSet);
+    const replyTunnel = inbound[0]!;
+    const storePayload = encodeDatabaseStoreLeaseSet2(encoded, {
+      replyToken: randomInt(1, 0x1_0000_0000),
+      replyTunnelId: replyTunnel.gatewayTunnelId,
+      replyGateway: replyTunnel.gatewayIdentityHash,
+    });
+    const store: I2npMessage = { type: 1, id: randomInt(1, 0x1_0000_0000), expiration: Date.now() + 60_000, payload: storePayload };
+    const outbound = this.tunnelPool.currentOutbound();
+    const floodfills = this.selectFloodfills(parsed.record.leaseSet.destinationHash, 3);
+    await Promise.all(floodfills.map(floodfill => this.sendToFloodfill(outbound, floodfill, store)));
+    this.emit('leaseSetPublished', parsed.record.leaseSet);
+    return encoded;
+  }
+
+  async refreshAddressBook(): Promise<{ host: string; path: string; imported: number; error?: string }[]> {
+    const results: { host: string; path: string; imported: number; error?: string }[] = [];
+    for (const subscription of ADDRESS_BOOK_SUBSCRIPTIONS) {
+      try {
+        const { stream } = await this.connectDestination(subscription.host);
+        try {
+          const response = await httpGetOverStream(stream, { host: subscription.host, path: subscription.path, timeoutMs: 120_000 });
+          if (response.status >= 400) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+          const imported = this.hosts.importHostsTxt(response.body.toString('utf8'));
+          results.push({ host: subscription.host, path: subscription.path, imported });
+          this.emit('addressBook', { host: subscription.host, imported });
+        } finally {
+          await stream.close().catch(() => undefined);
+        }
+      } catch (error) {
+        results.push({ host: subscription.host, path: subscription.path, imported: 0, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return results;
+  }
+
+  private async sendToFloodfill(outbound: BuiltOutboundTunnel, floodfill: Buffer, message: I2npMessage): Promise<void> {
+    const info = this.netDb.get(floodfill);
+    const enc = info?.identity.subarray(0, 32);
+    const wrapped = enc && enc.length === 32 ? wrapEciesRouterGarlicMessage(message, enc) : message;
+    await this.sendThroughOutboundTunnel(outbound, wrapped, { type: 'router', identityHash: floodfill });
+  }
+
   private handleNetDbReply(message: I2npMessage): void {
     try {
       if (message.type === 1) {
@@ -441,6 +505,7 @@ export class NativeRouterNode extends EventEmitter {
     try {
       const inner = decryptDatabaseLookupReply(message.payload.subarray(4), pending.key, pending.tag);
       this.handleNetDbReply(inner);
+      if (inner.type === 3) throw new Error('Floodfill does not have this LeaseSet');
       if (inner.type !== 1) throw new Error('Encrypted lookup missed the LeaseSet');
       const parsed = parseDatabaseStore(inner.payload);
       if (parsed.kind !== 'leaseSet2') throw new Error('Encrypted lookup reply was not a LeaseSet2');

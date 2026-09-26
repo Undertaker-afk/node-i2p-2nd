@@ -2,6 +2,7 @@ import { ByteReader, I2P_HASH_LENGTH } from '../protocol/common.ts';
 import { decryptAead, encryptAead } from '../crypto/x25519.ts';
 import type { I2npMessage } from '../protocol/i2np.ts';
 import { decodeI2np, encodeI2np } from '../protocol/i2np.ts';
+import { parseGarlicPayloadBlocks } from '../tunnel/garlic.ts';
 
 export type LookupKind = 'routerInfo' | 'exploration' | 'leaseSet';
 export type EncryptedLookupReply = { key: Buffer; tag: Buffer };
@@ -78,7 +79,18 @@ export function encryptDatabaseLookupReply(message: I2npMessage, key: Buffer, ta
 export function decryptDatabaseLookupReply(body: Buffer, key: Buffer, tag: Buffer): I2npMessage {
   if (!Buffer.isBuffer(body) || body.length < 8 + 16) throw new Error('Encrypted lookup reply is truncated');
   if (!body.subarray(0, 8).equals(tag)) throw new Error('Lookup reply tag mismatch');
-  return decodeI2np(decryptAead(key, Buffer.alloc(12), tag, body.subarray(8)));
+  const plaintext = decryptAead(key, Buffer.alloc(12), tag, body.subarray(8));
+  try { return decodeI2np(plaintext); }
+  catch {
+    try {
+      const parsed = parseGarlicPayloadBlocks(plaintext);
+      const clove = parsed.cloves[0];
+      if (!clove) throw new Error('Encrypted lookup reply Garlic contained no cloves');
+      return clove.message;
+    } catch {
+      throw new Error('Encrypted lookup reply is neither I2NP nor Garlic');
+    }
+  }
 }
 
 export function encodeDatabaseSearchReply(reply: DatabaseSearchReply): Buffer {

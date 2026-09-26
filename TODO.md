@@ -214,7 +214,7 @@ The project will be implemented in TypeScript from scratch. It will not delegate
 ## SAM and local client APIs
 
 - [ ] 181. Keep the existing SAM client API behavior covered while router APIs evolve.
-- [ ] 182. Implement a SAM server only after the router stream subsystem exists.
+- [x] 182. Implement a SAM server only after the router stream subsystem exists.
 - [ ] 183. Negotiate supported SAM versions accurately.
 - [ ] 184. Implement SAM session create, remove, and status semantics.
 - [ ] 185. Implement stream connect and accept against actual router destinations.
@@ -237,8 +237,8 @@ The project will be implemented in TypeScript from scratch. It will not delegate
 ## HTTP proxy and user-facing tools
 
 - [ ] 201. Maintain the existing HTTP proxy as a client of the SAM layer.
-- [ ] 202. Keep proxy bind default restricted to loopback.
-- [ ] 203. Validate absolute proxy URLs and reject clearnet targets.
+- [x] 202. Keep proxy bind default restricted to loopback.
+- [x] 203. Validate absolute proxy URLs and reject clearnet targets.
 - [ ] 204. Correctly preserve request methods, paths, headers, and streaming bodies.
 - [ ] 205. Handle upstream error and timeout paths without leaking sockets.
 - [ ] 206. Add limits for header sizes and concurrent proxy requests.
