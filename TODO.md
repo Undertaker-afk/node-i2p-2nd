@@ -217,7 +217,7 @@ The project will be implemented in TypeScript from scratch. It will not delegate
 - [x] 182. Implement a SAM server only after the router stream subsystem exists.
 - [ ] 183. Negotiate supported SAM versions accurately.
 - [ ] 184. Implement SAM session create, remove, and status semantics.
-- [ ] 185. Implement stream connect and accept against actual router destinations.
+- [x] 185. Implement stream connect and accept against actual router destinations.
 - [ ] 186. Implement datagram APIs only if their protocol behavior is supported.
 - [ ] 187. Validate all SAM commands and prevent command injection.
 - [ ] 188. Enforce authentication or loopback-only access for local APIs.
@@ -243,7 +243,7 @@ The project will be implemented in TypeScript from scratch. It will not delegate
 - [ ] 205. Handle upstream error and timeout paths without leaking sockets.
 - [ ] 206. Add limits for header sizes and concurrent proxy requests.
 - [ ] 207. Reject unsupported URL schemes clearly.
-- [ ] 208. Implement CONNECT tunneling only through real SAM streams.
+- [x] 208. Implement CONNECT tunneling only through real SAM streams.
 - [ ] 209. Add proxy tests with fake SAM and local HTTP fixtures.
 - [ ] 210. Add CLI validation for ports, hostnames, and storage paths.
 - [ ] 211. Add version and diagnostic subcommands.

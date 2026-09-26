@@ -8,7 +8,9 @@ import {
   wrapDestNewSession, wrapDestNewSessionReply, type EstablishedDestSession, type NewSessionResult,
 } from './crypto/ecies-dest.ts';
 import {
-  I2NP_DATA, STREAM_MAX_PACKET_SIZE, createClosePacket, createDataPacket, createSynAckPacket, createSynPacket, parseStreamingPacket,
+  I2NP_DATA, STREAM_CLOSE, STREAM_MAX_PACKET_SIZE, STREAM_RESET, STREAM_SYN,
+  createAckPacket, createClosePacket, createDataPacket, createResetPacket, createSynAckPacket, createSynPacket, parseStreamingPacket,
+  type StreamingPacket,
 } from './streaming.ts';
 import type { GarlicClove } from './tunnel/garlic.ts';
 import type { I2npMessage } from './protocol/i2np.ts';
@@ -30,14 +32,22 @@ type PendingConnect = {
 export class DestinationStream extends EventEmitter {
   sendStreamId: number;
   receiveStreamId: number;
-  private sequence = 1;
+  private nextSendSeq = 1;
+  private nextRecvSeq = 1;
   private readonly session: EstablishedDestSession;
   private readonly local: DestinationKeys;
   private readonly remoteHash: Buffer;
   private readonly sendGarlic: (message: I2npMessage, remote: RemoteLease) => Promise<void>;
   private readonly remote: RemoteLease;
   private closed = false;
+  private finished = false;
   private readonly queued: Buffer[] = [];
+  private readonly unacked = new Map<number, { packet: Buffer; sentAt: number; tries: number }>();
+  private readonly reorder = new Map<number, StreamingPacket>();
+  private readonly window = 32;
+  private readonly rtoMs = 1_500;
+  private retransmitTimer: NodeJS.Timeout | undefined;
+  private waitingForWindow: Array<() => void> = [];
 
   constructor(options: {
     session: EstablishedDestSession; local: DestinationKeys; remote: RemoteLease;
@@ -50,6 +60,8 @@ export class DestinationStream extends EventEmitter {
     this.sendStreamId = options.sendStreamId; this.receiveStreamId = options.receiveStreamId;
     this.sendGarlic = options.sendGarlic;
     this.on('newListener', event => { if (event === 'data') queueMicrotask(() => this.flushQueue()); });
+    this.retransmitTimer = setInterval(() => void this.retransmitExpired(), this.rtoMs);
+    this.retransmitTimer.unref();
   }
 
   get isClosed(): boolean { return this.closed; }
@@ -59,9 +71,13 @@ export class DestinationStream extends EventEmitter {
     if (!Buffer.isBuffer(payload)) throw new TypeError('payload must be a Buffer');
     if (payload.length === 0) return;
     for (let offset = 0; offset < payload.length; offset += STREAM_MAX_PACKET_SIZE) {
-      const chunk = payload.subarray(offset, offset + STREAM_MAX_PACKET_SIZE);
-      const packet = createDataPacket(this.sendStreamId, this.receiveStreamId, this.sequence++, this.sequence - 2, chunk);
-      await this.sendGarlic(wrapDestExistingSession(this.session, [dataClove(this.remoteHash, packet)]), this.remote);
+      await this.waitForWindow();
+      if (this.closed) throw new Error('Stream is closed');
+      const chunk = Buffer.from(payload.subarray(offset, offset + STREAM_MAX_PACKET_SIZE));
+      const seq = this.nextSendSeq++;
+      const packet = createDataPacket(this.sendStreamId, this.receiveStreamId, seq, this.nextRecvSeq - 1, chunk);
+      this.unacked.set(seq, { packet, sentAt: Date.now(), tries: 1 });
+      await this.sendPacket(packet);
     }
   }
 
@@ -69,27 +85,135 @@ export class DestinationStream extends EventEmitter {
     if (this.closed) return;
     this.closed = true;
     try {
-      const packet = createClosePacket(this.local, this.sendStreamId, this.receiveStreamId, this.sequence++, this.sequence - 2);
-      await this.sendGarlic(wrapDestExistingSession(this.session, [dataClove(this.remoteHash, packet)]), this.remote);
+      const seq = this.nextSendSeq++;
+      const packet = createClosePacket(this.local, this.sendStreamId, this.receiveStreamId, seq, this.nextRecvSeq - 1);
+      this.unacked.set(seq, { packet, sentAt: Date.now(), tries: 1 });
+      await this.sendPacket(packet);
     } finally {
-      this.emit('close');
+      this.finishClose();
+    }
+  }
+
+  async reset(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      await this.sendPacket(createResetPacket(this.sendStreamId, this.receiveStreamId, this.nextSendSeq, this.nextRecvSeq - 1));
+    } finally {
+      this.emit('error', new Error('Stream reset'));
+      this.finishClose();
     }
   }
 
   handleIncoming(payload: Buffer): boolean {
     const packet = parseStreamingPacket(payload);
     if (this.receiveStreamId !== 0 && packet.sendStreamId !== 0 && packet.sendStreamId !== this.receiveStreamId) return false;
+    this.applyAck(packet.ackThrough, packet.nacks);
+    if (packet.flags & STREAM_RESET) {
+      this.closed = true;
+      this.emit('error', new Error('Peer reset the stream'));
+      this.finishClose();
+      return true;
+    }
+    const hasData = packet.payload.length > 0 || (packet.flags & (STREAM_CLOSE | STREAM_SYN)) !== 0;
+    if (hasData) this.receivePacket(packet);
+    return true;
+  }
+
+  private receivePacket(packet: StreamingPacket): void {
+    if (packet.sequenceNum < this.nextRecvSeq) {
+      this.sendAck();
+      return;
+    }
+    if (packet.sequenceNum > this.nextRecvSeq) {
+      if (this.reorder.size < 256) this.reorder.set(packet.sequenceNum, packet);
+      this.sendAck();
+      return;
+    }
+    this.deliver(packet);
+    while (this.reorder.has(this.nextRecvSeq)) {
+      const next = this.reorder.get(this.nextRecvSeq)!;
+      this.reorder.delete(this.nextRecvSeq);
+      this.deliver(next);
+    }
+    this.sendAck();
+  }
+
+  private deliver(packet: StreamingPacket): void {
+    this.nextRecvSeq = packet.sequenceNum + 1;
     if (packet.payload.length) {
       if (this.listenerCount('data') > 0) this.emit('data', packet.payload);
       else this.queued.push(packet.payload);
     }
-    if (packet.flags & 2) {
-      if (!this.closed) {
-        this.closed = true;
-        this.emit('close');
-      }
+    if (packet.flags & STREAM_CLOSE) {
+      this.closed = true;
+      this.finishClose();
     }
-    return true;
+  }
+
+  private applyAck(ackThrough: number, nacks: readonly number[]): void {
+    for (const seq of [...this.unacked.keys()]) {
+      if (seq <= ackThrough && !nacks.includes(seq)) this.unacked.delete(seq);
+    }
+    for (const seq of nacks) {
+      const entry = this.unacked.get(seq);
+      if (entry) void this.sendPacket(entry.packet);
+    }
+    const waiters = this.waitingForWindow;
+    this.waitingForWindow = [];
+    for (const resume of waiters) resume();
+  }
+
+  private sendAck(): void {
+    if (this.closed) return;
+    const nacks: number[] = [];
+    const highest = Math.max(this.nextRecvSeq - 1, ...this.reorder.keys(), 0);
+    for (let seq = this.nextRecvSeq; seq <= highest && nacks.length < 8; seq++) {
+      if (!this.reorder.has(seq)) nacks.push(seq);
+    }
+    const packet = createAckPacket(this.sendStreamId, this.receiveStreamId, Math.max(0, this.nextSendSeq - 1), this.nextRecvSeq - 1, nacks);
+    void this.sendPacket(packet).catch(() => undefined);
+  }
+
+  private async waitForWindow(): Promise<void> {
+    while (this.unacked.size >= this.window && !this.closed) {
+      await new Promise<void>(resolve => this.waitingForWindow.push(resolve));
+    }
+  }
+
+  private async retransmitExpired(): Promise<void> {
+    if (this.closed) return;
+    const now = Date.now();
+    for (const [seq, entry] of this.unacked) {
+      if (now - entry.sentAt < this.rtoMs) continue;
+      if (entry.tries >= 8) {
+        this.closed = true;
+        this.emit('error', new Error(`Stream packet ${seq} timed out`));
+        this.finishClose();
+        return;
+      }
+      entry.tries++;
+      entry.sentAt = now;
+      await this.sendPacket(entry.packet).catch(() => undefined);
+    }
+  }
+
+  private async sendPacket(packet: Buffer): Promise<void> {
+    await this.sendGarlic(wrapDestExistingSession(this.session, [dataClove(this.remoteHash, packet)]), this.remote);
+  }
+
+  private finishClose(): void {
+    if (this.finished) return;
+    this.finished = true;
+    this.closed = true;
+    if (this.retransmitTimer) clearInterval(this.retransmitTimer);
+    this.retransmitTimer = undefined;
+    this.unacked.clear();
+    this.reorder.clear();
+    const waiters = this.waitingForWindow;
+    this.waitingForWindow = [];
+    for (const resume of waiters) resume();
+    this.emit('close');
   }
 
   private flushQueue(): void {
@@ -242,14 +366,32 @@ export class DestinationSessionManager extends EventEmitter {
     }
   }
 
+  async sendDatagram(remote: RemoteLease, payload: Buffer): Promise<void> {
+    const session = this.sessions.get(remote.encryptionPublicKey.toString('hex'));
+    const clove = dataClove(remote.destinationHash, payload);
+    if (session) {
+      await this.sendGarlic(wrapDestExistingSession(session, [clove]), remote);
+      return;
+    }
+    const pending = wrapDestNewSession(
+      this.localLeaseSet ? [leaseSetClove(this.localLeaseSet), clove] : [clove],
+      remote.encryptionPublicKey,
+      this.local.encryptionPublicKey,
+      this.local.encryptionPrivateKey,
+    );
+    await this.sendGarlic(pending.message, remote);
+  }
+
   private dispatchCloves(cloves: GarlicClove[]): void {
     this.ingestCloves(cloves);
     for (const clove of cloves) {
       if (clove.message.type !== I2NP_DATA) continue;
+      let matched = false;
       for (const stream of this.streams) {
-        try { if (stream.handleIncoming(clove.message.payload)) break; }
-        catch { /* not this stream */ }
+        try { if (stream.handleIncoming(clove.message.payload)) { matched = true; break; } }
+        catch { /* not a streaming packet for this stream */ }
       }
+      if (!matched) this.emit('datagram', clove.message.payload);
       this.emit('dataMessage', clove.message);
     }
   }

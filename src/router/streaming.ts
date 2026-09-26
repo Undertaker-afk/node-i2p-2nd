@@ -166,6 +166,18 @@ export function createClosePacket(local: DestinationKeys, sendStreamId: number, 
   }, local);
 }
 
+export function createAckPacket(sendStreamId: number, receiveStreamId: number, sequenceNum: number, ackThrough: number, nacks: number[] = []): Buffer {
+  return encodeStreamingPacket({
+    sendStreamId, receiveStreamId, sequenceNum, ackThrough, nacks, resendDelay: 1, flags: 0, payload: Buffer.alloc(0),
+  });
+}
+
+export function createResetPacket(sendStreamId: number, receiveStreamId: number, sequenceNum: number, ackThrough: number): Buffer {
+  return encodeStreamingPacket({
+    sendStreamId, receiveStreamId, sequenceNum, ackThrough, nacks: [], resendDelay: 1, flags: STREAM_RESET, payload: Buffer.alloc(0),
+  });
+}
+
 export const I2NP_DATA = 20;
 
 export function encodeDataMessage(payload: Buffer, id: number, expiration = Date.now() + 60_000): { type: number; id: number; expiration: number; payload: Buffer } {

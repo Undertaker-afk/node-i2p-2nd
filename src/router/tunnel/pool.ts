@@ -16,6 +16,7 @@ export type TunnelPoolOptions = {
   inboundCount?: number;
   outboundCount?: number;
   hopCount?: number;
+  maintainIntervalMs?: number;
 };
 
 /** Maintains inbound and outbound client tunnels, bootstrapping from a 0-hop inbound reply path. */
@@ -31,7 +32,9 @@ export class TunnelPool extends EventEmitter {
   private readonly inboundCount: number;
   private readonly outboundCount: number;
   private readonly hopCount: number;
+  private readonly maintainIntervalMs: number;
   private maintaining = false;
+  private timer: NodeJS.Timeout | undefined;
 
   constructor(options: TunnelPoolOptions) {
     super();
@@ -43,9 +46,21 @@ export class TunnelPool extends EventEmitter {
     this.inboundCount = options.inboundCount ?? 2;
     this.outboundCount = options.outboundCount ?? 2;
     this.hopCount = options.hopCount ?? 2;
+    this.maintainIntervalMs = options.maintainIntervalMs ?? 15_000;
     if (!Number.isInteger(this.inboundCount) || this.inboundCount < 1 || this.inboundCount > 16) throw new RangeError('inboundCount must be 1..16');
     if (!Number.isInteger(this.outboundCount) || this.outboundCount < 1 || this.outboundCount > 16) throw new RangeError('outboundCount must be 1..16');
     if (!Number.isInteger(this.hopCount) || this.hopCount < 1 || this.hopCount > 7) throw new RangeError('hopCount must be 1..7');
+    if (!Number.isInteger(this.maintainIntervalMs) || this.maintainIntervalMs < 1_000 || this.maintainIntervalMs > 600_000) throw new RangeError('maintainIntervalMs must be 1000..600000');
+  }
+
+  start(): void {
+    this.startZeroHopInbound();
+    if (this.timer) return;
+    this.timer = setInterval(() => {
+      void this.maintain().catch(error => this.emit('error', error));
+    }, this.maintainIntervalMs);
+    this.timer.unref();
+    void this.maintain().catch(error => this.emit('error', error));
   }
 
   get zeroHopTunnelId(): number | undefined { return this.zeroHopInboundId; }
@@ -79,11 +94,13 @@ export class TunnelPool extends EventEmitter {
     try {
       this.expire();
       const reply = this.inbound[0] ?? this.zeroHopReply();
+      let changed = false;
       while (this.outbound.length < this.outboundCount) {
         const path = this.selectPath(this.hopCount, this.usedIdentities());
         const tunnel = await this.builder.buildOutbound(path, { gatewayIdentityHash: reply.gatewayIdentityHash, tunnelId: reply.gatewayTunnelId });
         this.outbound.push(tunnel);
         this.emit('outbound', tunnel);
+        changed = true;
       }
       while (this.inbound.length < this.inboundCount) {
         const outbound = this.outbound[0];
@@ -98,11 +115,15 @@ export class TunnelPool extends EventEmitter {
         });
         this.inbound.push(tunnel);
         this.emit('inbound', tunnel);
+        changed = true;
       }
+      if (changed) this.emit('change');
     } finally { this.maintaining = false; }
   }
 
   stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
     this.inbound.length = 0;
     this.outbound.length = 0;
     if (this.zeroHopInboundId) this.transit.removeZeroHopInbound(this.zeroHopInboundId);

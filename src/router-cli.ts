@@ -11,6 +11,9 @@ import { createRouterInfoRecord, type RouterAddress } from './router/protocol/ro
 import { NativeRouterNode } from './router/node.ts';
 import { createNativeSamServer } from './router/native-sam.ts';
 import { createNativeHttpProxy } from './router/native-proxy.ts';
+import { createNativeSocksProxy } from './router/native-socks.ts';
+import { createRouterConsole } from './router/console.ts';
+import { parseTunnelsConf, startTunnelServices } from './router/tunnels-conf.ts';
 import { encodeDestinationBase64 } from './router/protocol/destination.ts';
 
 function usage(): string {
@@ -26,7 +29,13 @@ function usage(): string {
     '  --max-concurrent-tunnel-builds <n> Concurrent short builds (default: 8)',
     '  --proxy-host <host>  Native HTTP proxy bind host (default: 127.0.0.1)',
     '  --proxy-port <port>  Native HTTP proxy port (default: 4444)',
+    '  --socks-port <port>  Native SOCKS proxy port (default: 4447)',
+    '  --console-port <port> Local status page (default: 7070)',
+    '  --tunnels <path>     i2pd-style tunnels.conf',
+    '  --floodfill          Publish floodfill caps and answer netDb lookups',
     '  --no-proxy            Do not start the native HTTP proxy',
+    '  --no-socks            Do not start the SOCKS proxy',
+    '  --no-console          Do not start the status page',
     '  --no-transit          Decline new transit tunnel builds',
     '  --help                Show this help',
     '',
@@ -42,7 +51,9 @@ function parseArgs(argv: string[]): Map<string, string | true> {
     const equals = argument.indexOf('=');
     const key = equals < 0 ? argument.slice(2) : argument.slice(2, equals);
     if (!/^[a-z][a-z-]*$/.test(key) || result.has(key)) throw new Error(`Invalid or duplicate option: ${argument}`);
-    if (key === 'help' || key === 'no-transit' || key === 'no-proxy') { result.set(key, true); continue; }
+    if (key === 'help' || key === 'no-transit' || key === 'no-proxy' || key === 'no-socks' || key === 'no-console' || key === 'floodfill') {
+      result.set(key, true); continue;
+    }
     const value = equals < 0 ? argv[++index] : argument.slice(equals + 1);
     if (!value || value.startsWith('--')) throw new Error(`Option --${key} requires a value`);
     result.set(key, value);
@@ -52,16 +63,21 @@ function parseArgs(argv: string[]): Map<string, string | true> {
 
 function b64(value: Buffer): string { return value.toString('base64').replace(/\+/g, '-').replace(/\//g, '~'); }
 
+function portArg(args: Map<string, string | true>, key: string, fallback: number): number {
+  const value = Number(args.get(key) ?? fallback);
+  if (!Number.isInteger(value) || value < 1 || value > 65535) throw new RangeError(`--${key} must be 1..65535`);
+  return value;
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (args.has('help')) { process.stdout.write(`${usage()}\n`); return; }
   const publicHost = args.get('public-host');
   if (typeof publicHost !== 'string' || !publicHost.trim() || /[\s\r\n/]/.test(publicHost)) throw new Error('--public-host is required and must be a reachable host/IP (not a URL)');
   const bindHost = args.get('bind-host') ?? '0.0.0.0';
-  const port = Number(args.get('port') ?? 12345); const networkId = Number(args.get('net-id') ?? 2);
+  const port = portArg(args, 'port', 12345); const networkId = Number(args.get('net-id') ?? 2);
   const maxTransitTunnels = Number(args.get('max-transit-tunnels') ?? 5000);
   const maxConcurrentTunnelBuilds = Number(args.get('max-concurrent-tunnel-builds') ?? 8);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new RangeError('--port must be 1..65535');
   if (!Number.isInteger(networkId) || networkId < 1 || networkId > 255) throw new RangeError('--net-id must be a uint8');
   if (!Number.isInteger(maxTransitTunnels) || maxTransitTunnels < 1 || maxTransitTunnels > 100_000) throw new RangeError('--max-transit-tunnels must be 1..100000');
   if (!Number.isInteger(maxConcurrentTunnelBuilds) || maxConcurrentTunnelBuilds < 1 || maxConcurrentTunnelBuilds > 256) throw new RangeError('--max-concurrent-tunnel-builds must be 1..256');
@@ -70,6 +86,7 @@ async function main(): Promise<void> {
   const stateValue = args.get('state-dir') ?? defaultState;
   if (typeof stateValue !== 'string') throw new Error('--state-dir must be a path');
   const stateDir = path.resolve(stateValue);
+  const floodfill = args.has('floodfill');
 
   const identity = await loadOrCreateRouterIdentity(stateDir);
   const destination = await loadOrCreateDestinationKeys(stateDir);
@@ -85,11 +102,11 @@ async function main(): Promise<void> {
     ]),
   };
   const routerInfo = createRouterInfoRecord(identity, Date.now(), [address], new Map([
-    ['netId', String(networkId)], ['router.version', '0.9.64'], ['caps', 'NR'],
+    ['netId', String(networkId)], ['router.version', '0.9.64'], ['caps', floodfill ? 'fR' : 'NR'],
   ]));
   const nodeOptions = {
     identity, routerInfo, netDb, host: bindHost, port, publishedIv, networkId, maxTransitTunnels, maxConcurrentTunnelBuilds,
-    acceptTransitTunnels: !args.has('no-transit'), destination,
+    acceptTransitTunnels: !args.has('no-transit'), destination, floodfill,
   };
   const node = netDb.size < 10
     ? await NativeRouterNode.createFromReseed(nodeOptions)
@@ -112,21 +129,37 @@ async function main(): Promise<void> {
   const bound = await node.start();
   process.stdout.write(`Native TypeScript I2P router listening on ${bound.address}:${bound.port}; identity ${identity.identityHash.toString('base64')}\n`);
   process.stdout.write(`Local destination ${encodeDestinationBase64(destination.destination)}\n`);
-  process.stdout.write('NTCP2, ECIES short tunnels, Garlic-N, LeaseSet2, destination streaming, and address-book subscriptions are enabled.\n');
+  process.stdout.write('NTCP2, ECIES short tunnels, Garlic-N, LeaseSet2, reliable streaming, SAM, SOCKS, and address-book subscriptions are enabled.\n');
   const sam = createNativeSamServer(node, { host: '127.0.0.1', port: 7656 });
   const samAddr = await sam.listen();
   process.stdout.write(`Native SAM v3 listening on ${samAddr.address}:${samAddr.port}\n`);
   const proxyHost = args.get('proxy-host') ?? '127.0.0.1';
-  const proxyPort = Number(args.get('proxy-port') ?? 4444);
   if (typeof proxyHost !== 'string' || !proxyHost.trim()) throw new Error('--proxy-host must not be empty');
-  if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535) throw new RangeError('--proxy-port must be 1..65535');
-  const proxy = args.has('no-proxy') ? undefined : createNativeHttpProxy({ node, host: proxyHost, port: proxyPort });
+  const proxy = args.has('no-proxy') ? undefined : createNativeHttpProxy({ node, host: proxyHost, port: portArg(args, 'proxy-port', 4444) });
   if (proxy) {
     await proxy.listen();
-    process.stdout.write(`Native HTTP proxy listening on ${proxyHost}:${proxyPort} (http://*.i2p only)\n`);
+    process.stdout.write(`Native HTTP proxy listening on ${proxyHost}:${portArg(args, 'proxy-port', 4444)} (http://*.i2p only)\n`);
+  }
+  const socks = args.has('no-socks') ? undefined : createNativeSocksProxy({ node, host: '127.0.0.1', port: portArg(args, 'socks-port', 4447) });
+  if (socks) {
+    await socks.listen();
+    process.stdout.write(`Native SOCKS proxy listening on 127.0.0.1:${portArg(args, 'socks-port', 4447)}\n`);
+  }
+  const consoleServer = args.has('no-console') ? undefined : createRouterConsole(node, { host: '127.0.0.1', port: portArg(args, 'console-port', 7070) });
+  if (consoleServer) {
+    await consoleServer.listen();
+    process.stdout.write(`Router console listening on 127.0.0.1:${portArg(args, 'console-port', 7070)}\n`);
+  }
+  let tunnelServices: { close: () => Promise<void> } | undefined;
+  const tunnelsPath = args.get('tunnels');
+  if (typeof tunnelsPath === 'string') {
+    const parsed = parseTunnelsConf(await readFile(path.resolve(tunnelsPath), 'utf8'));
+    tunnelServices = startTunnelServices(node, parsed);
+    process.stdout.write(`Loaded ${parsed.length} tunnels from ${tunnelsPath}\n`);
   }
   node.on('bootstrapComplete', stats => {
     process.stdout.write(`Peer bootstrap complete: ${stats.connected} connected, ${stats.attempted} attempted\n`);
+    node.tunnelPool.start();
     void node.tunnelPool.maintain().then(async () => {
       process.stdout.write(`Tunnel pool ready: ${node.tunnelPool.inbound.length} inbound, ${node.tunnelPool.outbound.length} outbound\n`);
       await node.publishLocalLeaseSet();
@@ -143,6 +176,9 @@ async function main(): Promise<void> {
   let stopping = false;
   const shutdown = async () => {
     if (stopping) return; stopping = true;
+    if (tunnelServices) await tunnelServices.close();
+    if (consoleServer) await consoleServer.close();
+    if (socks) await socks.close();
     if (proxy) await proxy.close();
     await sam.close(); await node.stop(); process.exitCode = 0;
   };
