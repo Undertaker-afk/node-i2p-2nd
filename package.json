@@ -1,0 +1,24 @@
+{
+  "name": "node-i2p-client",
+  "version": "1.1.0",
+  "description": "TypeScript HTTP proxy client for I2P routers using SAM v3",
+  "type": "module",
+  "bin": {
+    "i2p-client": "src/cli.ts",
+    "i2p-native-router": "src/router-cli.ts"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types src/cli.ts",
+    "router": "node --experimental-strip-types src/router-cli.ts",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "check": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^7.0.2"
+  }
+}
