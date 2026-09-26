@@ -5,7 +5,7 @@ import type { I2npMessage } from '../protocol/i2np.ts';
 import type { Ntcp2Connection } from '../transport/ntcp2/connection.ts';
 import { processTunnelDataLayer, removeTunnelDataLayer } from './data.ts';
 import { decodeTunnelDataPayload, decodeTunnelGatewayPayload, encodeTunnelDataPayload, encodeTunnelGatewayPayload } from './messages.ts';
-import { unwrapEciesExistingSessionGarlicMessage, wrapEciesExistingSessionGarlicMessage } from './garlic.ts';
+import { unwrapEciesExistingSessionGarlicMessage, unwrapEciesRouterGarlicMessage, wrapEciesExistingSessionGarlicMessage } from './garlic.ts';
 import { buildTunnelMessageFragments } from './fragments.ts';
 import { TunnelFragmentReassembler } from './reassembly.ts';
 import {
@@ -14,6 +14,7 @@ import {
   SHORT_BUILD_ENDPOINT_FLAG, SHORT_BUILD_GATEWAY_FLAG,
 } from './short-build.ts';
 
+const I2NP_GARLIC = 11;
 const I2NP_TUNNEL_DATA = 18;
 const I2NP_TUNNEL_GATEWAY = 19;
 const I2NP_SHORT_TUNNEL_BUILD = 25;
@@ -64,6 +65,9 @@ export class TransitTunnelService extends EventEmitter {
   private readonly reassembler = new TunnelFragmentReassembler();
   private readonly replay = new Map<string, number>();
   private readonly outboundBuildReplies = new Map<string, { key: Buffer; tag: Buffer; expiresAt: number }>();
+  private readonly inboundBuildReplies = new Map<number, number>();
+  private readonly zeroHopInbounds = new Map<number, number>();
+  private readonly garlicReplay = new Set<string>();
   private messageId = randomInt(1, 0x1_0000_0000);
 
   constructor(options: TransitTunnelServiceOptions) {
@@ -131,6 +135,29 @@ export class TransitTunnelService extends EventEmitter {
     this.outboundBuildReplies.set(id, { key: Buffer.from(key), tag: Buffer.from(tag), expiresAt });
   }
 
+  /** Waits for a returning inbound ShortTunnelBuild (type 25) addressed to this creator. */
+  registerInboundBuildReply(messageId: number, expiresAt = Date.now() + 60_000): void {
+    if (!Number.isInteger(messageId) || messageId < 1 || messageId > 0xffff_ffff) throw new RangeError('Inbound build reply message ID must be a nonzero uint32');
+    if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now() || expiresAt > Date.now() + 10 * 60_000) throw new RangeError('Inbound build reply expiration is out of range');
+    this.expireBuildReplies(Date.now());
+    if (this.inboundBuildReplies.size >= MAX_PENDING_BUILDS) throw new Error('Pending inbound build reply limit reached');
+    if (this.inboundBuildReplies.has(messageId >>> 0)) throw new Error('Inbound build reply message ID is already registered');
+    this.inboundBuildReplies.set(messageId >>> 0, expiresAt);
+  }
+
+  cancelInboundBuildReply(messageId: number): boolean { return this.inboundBuildReplies.delete(messageId >>> 0); }
+
+  /** 0-hop inbound gateway/endpoint used to bootstrap the first real tunnels. */
+  registerZeroHopInbound(tunnelId: number, expiresAt = Date.now() + TRANSIT_TUNNEL_TTL_MS): void {
+    if (!Number.isSafeInteger(tunnelId) || tunnelId < 1 || tunnelId > 0xffff_ffff) throw new RangeError('Zero-hop inbound tunnel ID must be a nonzero uint32');
+    if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) throw new RangeError('Zero-hop inbound expiration is out of range');
+    this.expireTunnels(Date.now());
+    if (this.tunnels.has(tunnelId) || this.inboundEndpoints.has(tunnelId) || this.outboundEndpoints.has(tunnelId) || this.zeroHopInbounds.has(tunnelId)) throw new Error('Tunnel ID is already active');
+    this.zeroHopInbounds.set(tunnelId, expiresAt);
+  }
+
+  removeZeroHopInbound(tunnelId: number): boolean { return this.zeroHopInbounds.delete(tunnelId); }
+
   cancelOutboundBuildReplyKey(tag: Buffer): boolean {
     if (!Buffer.isBuffer(tag) || tag.length !== 8) return false;
     const id = tag.toString('hex');
@@ -142,7 +169,15 @@ export class TransitTunnelService extends EventEmitter {
   }
 
   async handleMessage(connection: Ntcp2Connection, message: I2npMessage): Promise<boolean> {
-    if (message.type === I2NP_SHORT_TUNNEL_BUILD) { await this.handleBuildRequest(connection, message); return true; }
+    if (message.type === I2NP_GARLIC) { await this.handleGarlic(connection, message); return true; }
+    if (message.type === I2NP_SHORT_TUNNEL_BUILD) {
+      if (this.inboundBuildReplies.has(message.id >>> 0)) {
+        this.inboundBuildReplies.delete(message.id >>> 0);
+        this.emit('inboundBuildReply', message);
+        return true;
+      }
+      await this.handleBuildRequest(connection, message); return true;
+    }
     if (message.type === I2NP_TUNNEL_DATA) { await this.handleTunnelData(message); return true; }
     if (message.type === I2NP_TUNNEL_GATEWAY) { await this.handleTunnelGateway(message); return true; }
     return false;
@@ -155,7 +190,46 @@ export class TransitTunnelService extends EventEmitter {
     for (const id of this.outboundEndpoints.keys()) this.removeOutboundEndpoint(id);
     for (const reply of this.outboundBuildReplies.values()) { reply.key.fill(0); reply.tag.fill(0); }
     this.outboundBuildReplies.clear();
+    this.inboundBuildReplies.clear();
+    this.zeroHopInbounds.clear();
+    this.garlicReplay.clear();
     this.reassembler.clear(); this.replay.clear();
+  }
+
+  private async handleGarlic(connection: Ntcp2Connection, message: I2npMessage): Promise<void> {
+    this.expireBuildReplies(Date.now());
+    if (message.payload.length >= 12) {
+      const tag = message.payload.subarray(4, 12).toString('hex');
+      const pending = this.outboundBuildReplies.get(tag);
+      if (pending) {
+        this.outboundBuildReplies.delete(tag);
+        try {
+          const reply = unwrapEciesExistingSessionGarlicMessage(message, pending.key, pending.tag);
+          if (reply.type !== I2NP_SHORT_TUNNEL_BUILD_REPLY) throw new Error('Garlic build reply clove did not contain type 26');
+          this.emit('outboundBuildReply', reply);
+        } catch (error) { this.emit('tunnelError', error); }
+        finally { pending.key.fill(0); pending.tag.fill(0); }
+        return;
+      }
+    }
+    let unwrapped;
+    try {
+      unwrapped = unwrapEciesRouterGarlicMessage(message, this.identity.encryptionPrivateKey, this.identity.identity.subarray(0, 32));
+    } catch (error) {
+      this.emit('tunnelError', error);
+      return;
+    }
+    const replayKey = unwrapped.ephemeralPublicKey.toString('hex');
+    if (this.garlicReplay.has(replayKey)) { this.emit('duplicateTunnelMessage', 0); return; }
+    this.garlicReplay.add(replayKey);
+    if (this.garlicReplay.size > MAX_REPLAY_ENTRIES) this.garlicReplay.delete(this.garlicReplay.keys().next().value!);
+    for (const clove of unwrapped.cloves) {
+      if (clove.delivery.type !== 'local') {
+        this.emit('tunnelError', new Error(`Router Garlic clove delivery ${clove.delivery.type} is not handled`));
+        continue;
+      }
+      await this.handleMessage(connection, clove.message);
+    }
   }
 
   private async handleBuildRequest(connection: Ntcp2Connection, message: I2npMessage): Promise<void> {
@@ -352,6 +426,11 @@ export class TransitTunnelService extends EventEmitter {
     try { gateway = decodeTunnelGatewayPayload(message.payload); }
     catch (error) { this.emit('tunnelError', error); return; }
     this.expireTunnels(Date.now());
+    if (this.zeroHopInbounds.has(gateway.tunnelId)) {
+      const synthetic = { remoteIdentityHash: this.identity.identityHash, isClosed: false, sendI2np: async () => undefined } as unknown as Ntcp2Connection;
+      await this.handleMessage(synthetic, gateway.message);
+      return;
+    }
     const tunnel = this.tunnels.get(gateway.tunnelId);
     if (!tunnel || !tunnel.gateway) return;
     const replayKey = createHash('sha256').update(`gateway:${gateway.tunnelId}:${gateway.message.id}`).digest('hex');
@@ -404,6 +483,9 @@ export class TransitTunnelService extends EventEmitter {
     for (const [id, endpoint] of this.outboundEndpoints) if (endpoint.expiresAt <= now) {
       this.removeOutboundEndpoint(id); this.emit('tunnelExpired', id);
     }
+    for (const [id, expiresAt] of this.zeroHopInbounds) if (expiresAt <= now) {
+      this.zeroHopInbounds.delete(id); this.emit('tunnelExpired', id);
+    }
   }
   private expireReplay(now: number): void {
     for (const [key, expiration] of this.replay) if (expiration <= now) this.replay.delete(key);
@@ -412,5 +494,6 @@ export class TransitTunnelService extends EventEmitter {
     for (const [tag, pending] of this.outboundBuildReplies) if (pending.expiresAt <= now) {
       pending.key.fill(0); pending.tag.fill(0); this.outboundBuildReplies.delete(tag);
     }
+    for (const [id, expiresAt] of this.inboundBuildReplies) if (expiresAt <= now) this.inboundBuildReplies.delete(id);
   }
 }

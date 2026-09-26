@@ -7,6 +7,7 @@ import { PersistentRouterInfoStore } from './router/netdb/persistent-store.ts';
 import { VerifiedRouterInfoStore } from './router/netdb/store.ts';
 import { createRouterInfoRecord, type RouterAddress } from './router/protocol/router-info.ts';
 import { NativeRouterNode } from './router/node.ts';
+import { createNativeSamServer } from './router/native-sam.ts';
 
 function usage(): string {
   return [
@@ -76,7 +77,7 @@ async function main(): Promise<void> {
     ]),
   };
   const routerInfo = createRouterInfoRecord(identity, Date.now(), [address], new Map([
-    ['netId', String(networkId)], ['router.version', '0.1.0'],
+    ['netId', String(networkId)], ['router.version', '0.9.64'], ['caps', 'NR'],
   ]));
   const nodeOptions = {
     identity, routerInfo, netDb, host: bindHost, port, publishedIv, networkId, maxTransitTunnels, maxConcurrentTunnelBuilds,
@@ -95,12 +96,21 @@ async function main(): Promise<void> {
   node.on('peer', (peer, _connection, direction) => process.stdout.write(`NTCP2 ${direction} peer ${peer ? Buffer.from(peer).toString('hex') : 'accepted'}\n`));
   const bound = await node.start();
   process.stdout.write(`Native TypeScript I2P router listening on ${bound.address}:${bound.port}; identity ${identity.identityHash.toString('base64')}\n`);
-  process.stdout.write('NTCP2 and experimental short-build transit are enabled. Full tunnel pools, garlic routing, destinations, and SAM/I2CP application access are not implemented.\n');
+  process.stdout.write('NTCP2, ECIES short tunnels, Garlic-N, LeaseSet2, and destination streaming are enabled.\n');
+  const sam = createNativeSamServer(node, { host: '127.0.0.1', port: 7656 });
+  const samAddr = await sam.listen();
+  process.stdout.write(`Native SAM v3 listening on ${samAddr.address}:${samAddr.port}\n`);
+  node.on('bootstrapComplete', stats => {
+    process.stdout.write(`Peer bootstrap complete: ${stats.connected} connected, ${stats.attempted} attempted\n`);
+    void node.tunnelPool.maintain().then(() => {
+      process.stdout.write(`Tunnel pool ready: ${node.tunnelPool.inbound.length} inbound, ${node.tunnelPool.outbound.length} outbound\n`);
+    }).catch(error => process.stderr.write(`tunnel pool: ${String(error)}\n`));
+  });
 
   let stopping = false;
   const shutdown = async () => {
     if (stopping) return; stopping = true;
-    await node.stop(); process.exitCode = 0;
+    await sam.close(); await node.stop(); process.exitCode = 0;
   };
   process.once('SIGINT', () => { void shutdown().catch(error => { process.stderr.write(`${String(error)}\n`); process.exitCode = 1; }); });
   process.once('SIGTERM', () => { void shutdown().catch(error => { process.stderr.write(`${String(error)}\n`); process.exitCode = 1; }); });

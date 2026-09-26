@@ -6,9 +6,11 @@ import { TransitTunnelService } from './transit.ts';
 import {
   decryptShortTunnelBuildReplyRecord, encodeShortBuildRequestPlaintext,
   encodeShortTunnelBuildPayload, encryptShortBuildRequestRecord, parseShortBuildReplyPlaintext,
-  parseShortTunnelBuildPayload, SHORT_BUILD_ENDPOINT_FLAG, SHORT_BUILD_MAX_RECORDS,
-  transformShortBuildReplyCoverRecords,
+  parseShortTunnelBuildPayload, preprocessShortBuildRequestRecords, SHORT_BUILD_ENDPOINT_FLAG,
+  SHORT_BUILD_GATEWAY_FLAG, SHORT_BUILD_MAX_RECORDS, transformShortBuildReplyCoverRecords,
+  type ShortBuildRecord,
 } from './short-build.ts';
+import { wrapEciesRouterGarlicMessage } from './garlic.ts';
 
 const I2NP_SHORT_TUNNEL_BUILD = 25;
 const DEFAULT_REPLY_TIMEOUT_MS = 30_000;
@@ -27,6 +29,13 @@ export type BuiltOutboundHop = ShortBuildHop & {
 export type BuiltOutboundTunnel = {
   gatewayIdentityHash: Buffer;
   gatewayTunnelId: number;
+  hops: BuiltOutboundHop[];
+  expiresAt: number;
+};
+export type BuiltInboundTunnel = {
+  gatewayIdentityHash: Buffer;
+  gatewayTunnelId: number;
+  receiveTunnelId: number;
   hops: BuiltOutboundHop[];
   expiresAt: number;
 };
@@ -70,9 +79,17 @@ export class ShortTunnelBuildCreator {
     finally { this.activeBuilds--; }
   }
 
+  /** Builds an inbound short tunnel. The creator is the IBEP; replies return as type-25 STBM. */
+  async buildInbound(path: readonly ShortBuildHop[], options: { sendBuild?: (message: I2npMessage) => Promise<void> } = {}): Promise<BuiltInboundTunnel> {
+    if (this.activeBuilds >= this.maxConcurrentBuilds) throw new Error('Concurrent tunnel build limit reached');
+    this.activeBuilds++;
+    try { return await this.buildInboundInternal(path, options.sendBuild); }
+    finally { this.activeBuilds--; }
+  }
+
   private async buildOutboundInternal(path: readonly ShortBuildHop[], replyTunnel: ShortBuildReplyTunnel): Promise<BuiltOutboundTunnel> {
     if (!Array.isArray(path) || path.length < 1 || path.length > SHORT_BUILD_MAX_RECORDS) throw new RangeError('Outbound short tunnel path must contain 1..8 hops');
-    if (!Buffer.isBuffer(replyTunnel.gatewayIdentityHash) || replyTunnel.gatewayIdentityHash.length !== 32 || replyTunnel.gatewayIdentityHash.equals(this.identity.identityHash)) throw new Error('Reply tunnel gateway identity is invalid');
+    if (!Buffer.isBuffer(replyTunnel.gatewayIdentityHash) || replyTunnel.gatewayIdentityHash.length !== 32) throw new Error('Reply tunnel gateway identity is invalid');
     if (!Number.isSafeInteger(replyTunnel.tunnelId) || replyTunnel.tunnelId < 1 || replyTunnel.tunnelId > 0xffff_ffff) throw new RangeError('Reply tunnel ID must be a nonzero uint32');
     for (const hop of path) {
       if (!Buffer.isBuffer(hop.identityHash) || hop.identityHash.length !== 32 || hop.identityHash.equals(this.identity.identityHash)) throw new Error('Tunnel hop identity hash is invalid');
@@ -108,7 +125,8 @@ export class ShortTunnelBuildCreator {
     const requestIndexes = recordIndexes.slice(0, path.length);
     const records: Buffer<ArrayBufferLike>[] = Array.from({ length: recordCount }, () => randomBytes(218));
     for (let hopIndex = 0; hopIndex < requests.length; hopIndex++) records[requestIndexes[hopIndex]!] = requests[hopIndex]!.bytes;
-    const payload = encodeShortTunnelBuildPayload(records);
+    const prepared = preprocessShortBuildRequestRecords(records, requestIndexes, requests.map(request => request.replyKey));
+    const payload = encodeShortTunnelBuildPayload(prepared);
     const endpointKeys = requests.at(-1)!;
     const expectedReplyId = endpointReplyMessageId;
     const expiration = Date.now() + this.replyTimeoutMs + 15_000;
@@ -153,24 +171,7 @@ export class ShortTunnelBuildCreator {
       if (replyMessage.expiration <= Date.now()) throw new Error('Outbound tunnel build reply has expired');
       const replyRecords = parseShortTunnelBuildPayload(replyMessage.payload);
       if (replyRecords.length !== recordCount) throw new Error('Outbound tunnel build reply record count does not match request');
-      const endpointRecordIndex = requestIndexes.at(-1)!;
-      const uncovered = transformShortBuildReplyCoverRecords(replyRecords, endpointRecordIndex, endpointKeys.replyKey);
-      builtHops = [];
-      try {
-        for (let index = 0; index < path.length; index++) {
-          const request = requests[index]!;
-          const recordIndex = requestIndexes[index]!;
-          const clear = decryptShortTunnelBuildReplyRecord(uncovered[recordIndex]!, recordIndex, request.replyKey, request.handshakeHash);
-          let status: number;
-          try { status = parseShortBuildReplyPlaintext(clear).returnCode; }
-          finally { clear.fill(0); }
-          if (status !== 0) throw new Error(`Outbound tunnel hop ${index + 1} rejected the request with status ${status}`);
-          builtHops.push({
-            identityHash: Buffer.from(path[index]!.identityHash), encryptionPublicKey: Buffer.from(path[index]!.encryptionPublicKey),
-            receiveTunnelId: receiveIds[index]!, layerKey: Buffer.from(request.layerKey), ivKey: Buffer.from(request.ivKey),
-          });
-        }
-      } finally { for (const record of uncovered) record.fill(0); }
+      builtHops = decodeBuildReplies(path, requests, requestIndexes, receiveIds, replyRecords, 'Outbound');
       return {
         gatewayIdentityHash: Buffer.from(path[0]!.identityHash), gatewayTunnelId: receiveIds[0]!,
         hops: builtHops, expiresAt: Date.now() + DEFAULT_TUNNEL_LIFETIME_MS,
@@ -193,6 +194,113 @@ export class ShortTunnelBuildCreator {
     }
   }
 
+  private async buildInboundInternal(path: readonly ShortBuildHop[], sendBuild?: (message: I2npMessage) => Promise<void>): Promise<BuiltInboundTunnel> {
+    this.validatePath(path, 'Inbound');
+    const recordCount = Math.max(4, path.length + 1);
+    const receiveIds = path.map(() => this.uniqueTunnelId());
+    const creatorReceiveId = this.uniqueTunnelId();
+    if (new Set([...receiveIds, creatorReceiveId]).size !== receiveIds.length + 1) throw new Error('Tunnel ID generator returned a duplicate ID');
+    const nextMessageIds = path.map(() => this.uniqueMessageId());
+    const replyMessageId = nextMessageIds.at(-1)!;
+    const requests = path.map((hop, index) => {
+      const isGateway = index === 0;
+      const isLast = index === path.length - 1;
+      const nextHash = isLast ? this.identity.identityHash : path[index + 1]!.identityHash;
+      const nextId = isLast ? creatorReceiveId : receiveIds[index + 1]!;
+      const plaintext = encodeShortBuildRequestPlaintext({
+        receiveTunnelId: receiveIds[index]!, nextTunnelId: nextId, nextIdentityHash: nextHash,
+        flags: isGateway ? SHORT_BUILD_GATEWAY_FLAG : 0,
+        nextMessageId: nextMessageIds[index]!,
+      });
+      return encryptShortBuildRequestRecord(hop.identityHash, hop.encryptionPublicKey, plaintext);
+    });
+    const recordIndexes = Array.from({ length: recordCount }, (_, index) => index);
+    for (let index = recordIndexes.length - 1; index > 0; index--) {
+      const other = randomInt(index + 1);
+      [recordIndexes[index], recordIndexes[other]] = [recordIndexes[other]!, recordIndexes[index]!];
+    }
+    const requestIndexes = recordIndexes.slice(0, path.length);
+    const phonyIndex = recordIndexes[path.length]!;
+    const records: Buffer[] = Array.from({ length: recordCount }, () => randomBytes(218));
+    for (let hopIndex = 0; hopIndex < requests.length; hopIndex++) records[requestIndexes[hopIndex]!] = requests[hopIndex]!.bytes;
+    const phony = records[phonyIndex]!;
+    this.identity.identityHash.subarray(0, 16).copy(phony, 0);
+    randomBytes(32).copy(phony, 16);
+    const prepared = preprocessShortBuildRequestRecords(
+      records,
+      [...requestIndexes, phonyIndex],
+      [...requests.map(request => request.replyKey), Buffer.alloc(32)],
+    );
+    const payload = encodeShortTunnelBuildPayload(prepared);
+    const expiration = Date.now() + this.replyTimeoutMs + 15_000;
+    this.transitTunnels.registerInboundBuildReply(replyMessageId, expiration);
+
+    let timeout: NodeJS.Timeout | undefined;
+    let onReply: ((message: I2npMessage) => void) | undefined;
+    const replyPromise = new Promise<I2npMessage>((resolve, reject) => {
+      onReply = message => {
+        if (message.id !== replyMessageId || message.type !== I2NP_SHORT_TUNNEL_BUILD) return;
+        cleanup(); resolve(message);
+      };
+      const cleanup = (): void => {
+        if (timeout) clearTimeout(timeout);
+        this.transitTunnels.off('inboundBuildReply', onReply!);
+      };
+      timeout = setTimeout(() => { cleanup(); reject(new Error('Inbound tunnel build reply timed out')); }, this.replyTimeoutMs);
+      this.transitTunnels.on('inboundBuildReply', onReply);
+    });
+
+    let builtHops: BuiltOutboundHop[] = [];
+    try {
+      const first = path[0]!;
+      const stbm: I2npMessage = { type: I2NP_SHORT_TUNNEL_BUILD, id: this.uniqueMessageId(), expiration, payload };
+      if (sendBuild) await sendBuild(stbm);
+      else {
+        const garlic = wrapEciesRouterGarlicMessage(stbm, first.encryptionPublicKey);
+        const connection = await this.connectPeer(first.identityHash);
+        if (connection.remoteIdentityHash && !connection.remoteIdentityHash.equals(first.identityHash)) throw new Error('Inbound gateway connection identity mismatch');
+        await connection.sendI2np(garlic);
+      }
+      const replyMessage = await replyPromise;
+      this.transitTunnels.cancelInboundBuildReply(replyMessageId);
+      if (replyMessage.expiration <= Date.now()) throw new Error('Inbound tunnel build reply has expired');
+      const replyRecords = parseShortTunnelBuildPayload(replyMessage.payload);
+      if (replyRecords.length !== recordCount) throw new Error('Inbound tunnel build reply record count does not match request');
+      builtHops = decodeBuildReplies(path, requests, requestIndexes, receiveIds, replyRecords, 'Inbound');
+      this.transitTunnels.registerInboundEndpoint(creatorReceiveId, builtHops.map(({ layerKey, ivKey }) => ({ layerKey, ivKey })));
+      return {
+        gatewayIdentityHash: Buffer.from(path[0]!.identityHash),
+        gatewayTunnelId: receiveIds[0]!,
+        receiveTunnelId: creatorReceiveId,
+        hops: builtHops,
+        expiresAt: Date.now() + DEFAULT_TUNNEL_LIFETIME_MS,
+      };
+    } catch (error) {
+      if (onReply) this.transitTunnels.off('inboundBuildReply', onReply);
+      if (timeout) clearTimeout(timeout);
+      this.transitTunnels.cancelInboundBuildReply(replyMessageId);
+      for (const hop of builtHops) { hop.layerKey.fill(0); hop.ivKey.fill(0); }
+      throw error;
+    } finally {
+      for (const request of requests) {
+        request.replyKey.fill(0); request.handshakeHash.fill(0);
+        request.layerKey.fill(0); request.ivKey.fill(0);
+      }
+    }
+  }
+
+  private validatePath(path: readonly ShortBuildHop[], label: string): void {
+    if (!Array.isArray(path) || path.length < 1 || path.length > SHORT_BUILD_MAX_RECORDS - 1) throw new RangeError(`${label} short tunnel path must contain 1..7 hops`);
+    const seen = new Set<string>([this.identity.identityHash.toString('hex')]);
+    for (const hop of path) {
+      if (!Buffer.isBuffer(hop.identityHash) || hop.identityHash.length !== 32 || hop.identityHash.equals(this.identity.identityHash)) throw new Error('Tunnel hop identity hash is invalid');
+      if (!Buffer.isBuffer(hop.encryptionPublicKey) || hop.encryptionPublicKey.length !== 32) throw new Error('Tunnel hop X25519 public key is invalid');
+      const id = hop.identityHash.toString('hex');
+      if (seen.has(id)) throw new Error(`${label} tunnel path contains a repeated router`);
+      seen.add(id);
+    }
+  }
+
   private uniqueTunnelId(): number {
     const id = this.tunnelId();
     if (!Number.isSafeInteger(id) || id < 1 || id > 0xffff_ffff) throw new RangeError('Tunnel ID generator returned an invalid value');
@@ -203,4 +311,33 @@ export class ShortTunnelBuildCreator {
     if (!Number.isSafeInteger(id) || id < 1 || id > 0xffff_ffff) throw new RangeError('Message ID generator returned an invalid value');
     return id;
   }
+}
+
+function decodeBuildReplies(
+  path: readonly ShortBuildHop[],
+  requests: readonly ShortBuildRecord[],
+  requestIndexes: readonly number[],
+  receiveIds: readonly number[],
+  replyRecords: Buffer[],
+  label: string,
+): BuiltOutboundHop[] {
+  let records: Buffer[] = replyRecords.map(record => Buffer.from(record));
+  const hops: BuiltOutboundHop[] = new Array(path.length);
+  try {
+    for (let index = path.length - 1; index >= 0; index--) {
+      const request = requests[index]!;
+      const recordIndex = requestIndexes[index]!;
+      const clear = decryptShortTunnelBuildReplyRecord(records[recordIndex]!, recordIndex, request.replyKey, request.handshakeHash);
+      let status: number;
+      try { status = parseShortBuildReplyPlaintext(clear).returnCode; }
+      finally { clear.fill(0); }
+      if (status !== 0) throw new Error(`${label} tunnel hop ${index + 1} rejected the request with status ${status}`);
+      hops[index] = {
+        identityHash: Buffer.from(path[index]!.identityHash), encryptionPublicKey: Buffer.from(path[index]!.encryptionPublicKey),
+        receiveTunnelId: receiveIds[index]!, layerKey: Buffer.from(request.layerKey), ivKey: Buffer.from(request.ivKey),
+      };
+      records = transformShortBuildReplyCoverRecords(records, recordIndex, request.replyKey);
+    }
+  } finally { for (const record of records) record.fill(0); }
+  return hops;
 }

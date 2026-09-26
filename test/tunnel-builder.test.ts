@@ -184,3 +184,55 @@ test('short outbound build and outbound data traverse a three-router simulated p
   for (const service of services) service.stop();
   creatorTransit.stop();
 });
+
+test('inbound short tunnel is garlic-wrapped and the type-25 reply returns to the creator', async () => {
+  const creatorIdentity = createRouterIdentity();
+  const gatewayIdentity = createRouterIdentity();
+  const creatorSent: I2npMessage[] = [];
+  const gatewaySent: I2npMessage[] = [];
+  const creatorTransit = new TransitTunnelService({
+    identity: creatorIdentity,
+    connectPeer: async () => { throw new Error('creator should not dial for inbound reply'); },
+  });
+  const creatorConnection = {
+    remoteIdentityHash: creatorIdentity.identityHash, isClosed: false,
+    sendI2np: async (message: I2npMessage) => {
+      creatorSent.push({ ...message, payload: Buffer.from(message.payload) });
+      await creatorTransit.handleMessage(gatewayConnection as never, message);
+    },
+  };
+  const gatewayTransit = new TransitTunnelService({
+    identity: gatewayIdentity,
+    connectPeer: async hash => {
+      assert.deepEqual(hash, creatorIdentity.identityHash);
+      return creatorConnection as never;
+    },
+  });
+  const gatewayConnection = {
+    remoteIdentityHash: gatewayIdentity.identityHash, isClosed: false,
+    sendI2np: async (message: I2npMessage) => {
+      gatewaySent.push({ ...message, payload: Buffer.from(message.payload) });
+      await gatewayTransit.handleMessage(creatorConnection as never, message);
+    },
+  };
+  const builder = new ShortTunnelBuildCreator({
+    identity: creatorIdentity, transitTunnels: creatorTransit,
+    connectPeer: async hash => {
+      assert.deepEqual(hash, gatewayIdentity.identityHash);
+      return gatewayConnection as never;
+    },
+    replyTimeoutMs: 3_000,
+    tunnelId: (() => { let id = 800; return () => id++; })(),
+    messageId: (() => { let id = 900; return () => id++; })(),
+  });
+  const tunnel = await builder.buildInbound([{
+    identityHash: gatewayIdentity.identityHash,
+    encryptionPublicKey: gatewayIdentity.identity.subarray(0, 32),
+  }]);
+  assert.equal(gatewaySent.length, 1);
+  assert.equal(gatewaySent[0]!.type, 11);
+  assert.equal(tunnel.gatewayIdentityHash.toString('hex'), gatewayIdentity.identityHash.toString('hex'));
+  assert.equal(tunnel.hops.length, 1);
+  assert.ok(tunnel.receiveTunnelId > 0);
+  creatorTransit.stop(); gatewayTransit.stop();
+});

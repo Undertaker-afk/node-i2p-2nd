@@ -222,17 +222,20 @@ export function decryptShortTunnelBuildReplyRecord(record: Buffer, recordIndex: 
   return decryptAead(replyKey, nonce, handshakeHash, record);
 }
 
-/** Writes one hop's AEAD reply into its slot while keeping later unprocessed request records intact. */
+/** Writes one hop's AEAD reply and ChaCha20-covers every other record, matching independent I2P routers. */
 export function encryptShortTunnelBuildTransitRequest(records: readonly Buffer[], selectedIndex: number, replyPlaintext: Buffer, replyKey: Buffer, handshakeHash: Buffer): Buffer[] {
-  if (records.length < 1 || records.length > SHORT_BUILD_MAX_RECORDS || !Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= records.length) throw new Error('Invalid short-build transit record selection');
-  if (!Buffer.isBuffer(replyPlaintext) || replyPlaintext.length !== SHORT_BUILD_REPLY_SIZE) throw new Error('Short-build reply plaintext must be 202 bytes');
-  if (!Buffer.isBuffer(replyKey) || replyKey.length !== 32 || !Buffer.isBuffer(handshakeHash) || handshakeHash.length !== 32) throw new Error('Short-build reply keys must be 32 bytes');
-  return records.map((record, index) => {
-    if (!Buffer.isBuffer(record) || record.length !== SHORT_BUILD_RECORD_SIZE) throw new Error('Each Short Tunnel Build record must be 218 bytes');
-    if (index !== selectedIndex) return Buffer.from(record);
-    const nonce = Buffer.alloc(12); nonce[4] = index;
-    return encryptAead(replyKey, nonce, handshakeHash, replyPlaintext);
-  });
+  return encryptShortTunnelBuildReply(records, selectedIndex, replyPlaintext, replyKey, handshakeHash);
+}
+
+/** Applies or removes the ChaCha20 cover for one 218-byte short-build record. ChaCha20 is involutive. */
+export function chachaShortBuildRecord(record: Buffer, recordIndex: number, replyKey: Buffer): Buffer {
+  if (!Buffer.isBuffer(record) || record.length !== SHORT_BUILD_RECORD_SIZE) throw new Error('Each Short Tunnel Build record must be 218 bytes');
+  if (!Number.isInteger(recordIndex) || recordIndex < 0 || recordIndex >= SHORT_BUILD_MAX_RECORDS) throw new RangeError('Short-build record index is out of range');
+  if (!Buffer.isBuffer(replyKey) || replyKey.length !== 32) throw new Error('Short-build reply key must be 32 bytes');
+  const nonce = Buffer.alloc(12); nonce[4] = recordIndex;
+  const chachaIv = Buffer.alloc(16); chachaIv.writeUInt32LE(1, 0); nonce.copy(chachaIv, 4);
+  const cipher = createCipheriv('chacha20', replyKey, chachaIv);
+  return Buffer.concat([cipher.update(record), cipher.final()]);
 }
 
 /** Removes/adds the ChaCha20 cover layer for every record except the hop's own AEAD record. */
@@ -242,11 +245,30 @@ export function transformShortBuildReplyCoverRecords(records: readonly Buffer[],
   return records.map((record, index) => {
     if (!Buffer.isBuffer(record) || record.length !== SHORT_BUILD_RECORD_SIZE) throw new Error('Each Short Tunnel Build record must be 218 bytes');
     if (index === selectedIndex) return Buffer.from(record);
-    const nonce = Buffer.alloc(12); nonce[4] = index;
-    const chachaIv = Buffer.alloc(16); chachaIv.writeUInt32LE(1, 0); nonce.copy(chachaIv, 4);
-    const cipher = createCipheriv('chacha20', replyKey, chachaIv);
-    return Buffer.concat([cipher.update(record), cipher.final()]);
+    return chachaShortBuildRecord(record, index, replyKey);
   });
+}
+
+/**
+ * Creator-side telescoping: inverse-ChaCha later hop request records with earlier hops' reply keys
+ * so that each participant's ChaCha cover restores the next hop's Noise request.
+ */
+export function preprocessShortBuildRequestRecords(
+  records: Buffer[],
+  hopRecordIndexes: readonly number[],
+  hopReplyKeys: readonly Buffer[],
+): Buffer[] {
+  if (records.length < 1 || records.length > SHORT_BUILD_MAX_RECORDS) throw new RangeError('Short Tunnel Build must contain 1..8 records');
+  if (hopRecordIndexes.length !== hopReplyKeys.length || hopRecordIndexes.length < 1) throw new Error('Hop reply keys and record indexes must match');
+  const output: Buffer[] = records.map(record => Buffer.from(record));
+  for (let hopIndex = hopRecordIndexes.length - 2; hopIndex >= 0; hopIndex--) {
+    const replyKey = hopReplyKeys[hopIndex]!;
+    for (let later = hopIndex + 1; later < hopRecordIndexes.length; later++) {
+      const recordIndex = hopRecordIndexes[later]!;
+      output[recordIndex] = chachaShortBuildRecord(output[recordIndex]!, recordIndex, replyKey);
+    }
+  }
+  return output;
 }
 
 /** Encrypts a Short Tunnel Build Reply: AEAD for the selected record, ChaCha20 for cover records. */
