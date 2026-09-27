@@ -6,10 +6,13 @@ import type { I2npMessage } from './protocol/i2np.ts';
 import { VerifiedRouterInfoStore } from './netdb/store.ts';
 import { PeerNetDbService } from './netdb/peer-service.ts';
 import { reseedRouterInfoStore, type ReseedOptions } from './netdb/reseed.ts';
-import { createRouterInfoRecord, parseRouterInfo } from './protocol/router-info.ts';
+import { createRouterInfoRecord, parseRouterInfo, type RouterInfo } from './protocol/router-info.ts';
 import { acceptNtcp2 } from './transport/ntcp2/accept.ts';
 import { connectNtcp2 } from './transport/ntcp2/connect.ts';
-import { Ntcp2Connection } from './transport/ntcp2/connection.ts';
+import { isPeerConnection, type PeerConnection } from './transport/peer-connection.ts';
+import { Ssu2Transport } from './transport/ssu2/transport.ts';
+import type { Ssu2Session } from './transport/ssu2/session.ts';
+import { hasDialableNtcp2, hasDialableSsu2 } from './transport/ssu2/address.ts';
 import { Ntcp2Listener } from './transport/ntcp2/listener.ts';
 import type { Ntcp2ConnectOptions } from './transport/ntcp2/connect.ts';
 import { TransitTunnelService } from './tunnel/transit.ts';
@@ -25,6 +28,7 @@ import { ADDRESS_BOOK_SUBSCRIPTIONS, HostsBook } from './netdb/hosts.ts';
 import { httpGetOverStream } from './http-client.ts';
 import { destinationBytesFromHelper, extractHelperDestination, JUMP_SERVICES } from './http-helper.ts';
 import { PeerProfiler } from './peer-profile.ts';
+import { compareXorDistance, routingKey } from './netdb/routing-key.ts';
 import { TunnelTester } from './tunnel/test.ts';
 import { TokenBucket } from './util/rate-limit.ts';
 import { I2NP_DELIVERY_STATUS } from './protocol/delivery-status.ts';
@@ -56,6 +60,10 @@ export type NativeRouterNodeOptions = {
   exploratoryCount?: number;
   outboundBytesPerSecond?: number;
   enableJump?: boolean;
+  /** Enables the SSU2 UDP transport. The local RouterInfo must publish a matching SSU2 address. */
+  ssu2?: { port: number; introKey: Buffer; host?: string; mtu?: number };
+  /** Dial SSU2 before NTCP2 when a peer publishes both (default true). */
+  preferSsu2?: boolean;
 };
 
 export type RouterStatus = {
@@ -71,6 +79,9 @@ export type RouterStatus = {
   running: boolean;
   exploratoryInbound: number;
   exploratoryOutbound: number;
+  ntcp2Peers: number;
+  ssu2Peers: number;
+  ssu2Listening: boolean;
 };
 
 export class DatabaseSearchError extends Error {
@@ -82,6 +93,29 @@ export class DatabaseSearchError extends Error {
 }
 
 /** Small direct-peer node that composes NTCP2, verified RouterInfo storage, and I2NP netDb handling. */
+/** Version triple compare for "router.version" strings such as 0.9.62. */
+function versionAtLeast(version: string, minimum: readonly number[]): boolean {
+  const parts = version.split('.').map(part => Number.parseInt(part, 10));
+  for (let index = 0; index < minimum.length; index++) {
+    const value = Number.isFinite(parts[index]) ? parts[index]! : 0;
+    if (value !== minimum[index]) return value > minimum[index]!;
+  }
+  return true;
+}
+
+/**
+ * ShortTunnelBuild (I2NP 25) needs router.version >= 0.9.51, and the "G" cap means the router
+ * rejects all tunnels. Routers without a numeric version option are accepted (local/test routers).
+ */
+export function acceptsShortTunnelBuilds(info: RouterInfo): boolean {
+  const caps = info.options.get('caps') ?? '';
+  if (caps.includes('G')) return false;
+  const version = info.options.get('router.version');
+  // Only numeric versions are judged; real routers always publish one (e.g. "0.9.64").
+  if (version === undefined || !/^\d+(\.\d+)*$/.test(version)) return true;
+  return versionAtLeast(version, [0, 9, 51]);
+}
+
 export class NativeRouterNode extends EventEmitter {
   static async createFromReseed(options: NativeRouterNodeOptions, reseedOptions: ReseedOptions = {}): Promise<NativeRouterNode> {
     if (options.netDb.size < (reseedOptions.minRouterInfos ?? 10)) await reseedRouterInfoStore(options.netDb, reseedOptions);
@@ -103,6 +137,8 @@ export class NativeRouterNode extends EventEmitter {
   private readonly outboundLimiter: TokenBucket;
   private readonly enableJump: boolean;
   readonly listener: Ntcp2Listener;
+  readonly ssu2: Ssu2Transport | undefined;
+  private readonly preferSsu2: boolean;
   private readonly connectOptions: Ntcp2ConnectOptions;
   private readonly maxOutboundConnections: number;
   private readonly targetOutboundPeers: number;
@@ -112,8 +148,10 @@ export class NativeRouterNode extends EventEmitter {
   private refreshTimer: NodeJS.Timeout | undefined;
   private bootstrapping: Promise<number> | undefined;
   private readonly pendingInfoLookups = new Map<string, NodeJS.Timeout>();
-  private readonly peers = new Map<string, Ntcp2Connection>();
-  private readonly connecting = new Map<string, Promise<Ntcp2Connection>>();
+  private readonly peers = new Map<string, PeerConnection>();
+  private readonly connecting = new Map<string, Promise<PeerConnection>>();
+  /** Authenticated inbound sessions, reused by connectPeer() instead of dialing a second session. */
+  private readonly inboundPeers = new Map<string, PeerConnection>();
   private started = false;
   private stopping = false;
 
@@ -136,7 +174,7 @@ export class NativeRouterNode extends EventEmitter {
       ...(options.maxConcurrentTunnelBuilds === undefined ? {} : { maxConcurrentBuilds: options.maxConcurrentTunnelBuilds }),
     });
     this.netDbProtocol.on('message', (connection, message) => {
-      void this.transitTunnels.handleMessage(connection as Ntcp2Connection, message).catch(error => this.emit('tunnelError', error));
+      void this.transitTunnels.handleMessage(connection as PeerConnection, message).catch(error => this.emit('tunnelError', error));
     });
     this.transitTunnels.on('tunnelError', error => this.emit('tunnelError', error));
     this.transitTunnels.on('localMessage', message => {
@@ -146,14 +184,16 @@ export class NativeRouterNode extends EventEmitter {
     this.transitTunnels.on('inboundBuildReply', message => this.emit('inboundBuildReply', message));
     this.transitTunnels.on('outboundBuildReply', message => this.emit('outboundBuildReply', message));
     this.transitTunnels.on('routerDelivery', (delivery, message) => {
-      if (delivery.identityHash.equals(this.identity.identityHash)) { this.emit('tunnelMessage', message); return; }
+      if (delivery.identityHash.equals(this.identity.identityHash)) { this.deliverToSelf(message); return; }
       void this.connectPeer(delivery.identityHash).then(connection => connection.sendI2np(message)).catch(error => this.emit('tunnelError', error));
     });
     this.transitTunnels.on('tunnelDelivery', (delivery, message) => {
-      void this.connectPeer(delivery.gatewayHash).then(connection => connection.sendI2np({
+      const gatewayMessage: I2npMessage = {
         type: 19, id: randomInt(1, 0x1_0000_0000), expiration: message.expiration,
         payload: encodeTunnelGatewayPayload(delivery.tunnelId, message),
-      })).catch(error => this.emit('tunnelError', error));
+      };
+      if (delivery.gatewayHash.equals(this.identity.identityHash)) { this.deliverToSelf(gatewayMessage); return; }
+      void this.connectPeer(delivery.gatewayHash).then(connection => connection.sendI2np(gatewayMessage)).catch(error => this.emit('tunnelError', error));
     });
     this.listener = new Ntcp2Listener({
       identity: options.identity, routerInfo: options.routerInfo, publishedIv: options.publishedIv,
@@ -163,6 +203,15 @@ export class NativeRouterNode extends EventEmitter {
       ...(options.maxClockSkewSeconds === undefined ? {} : { maxClockSkewSeconds: options.maxClockSkewSeconds }),
       ...(options.maxInboundConnections === undefined ? {} : { maxConnections: options.maxInboundConnections }),
     });
+    this.ssu2 = options.ssu2 ? new Ssu2Transport({
+      identity: options.identity, routerInfo: options.routerInfo, introKey: options.ssu2.introKey,
+      host: options.ssu2.host ?? options.host, port: options.ssu2.port,
+      ...(options.networkId === undefined ? {} : { networkId: options.networkId }),
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+      ...(options.maxClockSkewSeconds === undefined ? {} : { maxClockSkewSeconds: options.maxClockSkewSeconds }),
+      ...(options.ssu2.mtu === undefined ? {} : { mtu: options.ssu2.mtu }),
+    }) : undefined;
+    this.preferSsu2 = options.preferSsu2 ?? true;
     this.connectOptions = {
       ...(options.networkId === undefined ? {} : { networkId: options.networkId }),
       ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
@@ -207,6 +256,15 @@ export class NativeRouterNode extends EventEmitter {
     });
     this.tunnelPool.on('error', error => this.emit('tunnelError', error));
     this.listener.on('connection', connection => this.onInbound(connection));
+    if (this.ssu2) {
+      this.ssu2.on('connection', (session: Ssu2Session) => this.onInbound(session));
+      this.ssu2.on('routerInfo', (bytes: Buffer) => {
+        try { this.netDbProtocol.store.store(parseRouterInfo(bytes)); } catch (error) { this.emit('netDbError', error); }
+      });
+      this.ssu2.on('handshakeError', error => this.emit('transportError', error));
+      this.ssu2.on('transportError', error => this.emit('transportError', error));
+      this.ssu2.on('observedAddress', address => this.emit('observedAddress', address, 'SSU2'));
+    }
     this.listener.on('handshakeError', error => this.emit('transportError', error));
     this.listener.on('listenerError', error => this.emit('transportError', error));
     this.netDbProtocol.on('messageError', (error, message) => this.emit('netDbError', error, message));
@@ -219,7 +277,7 @@ export class NativeRouterNode extends EventEmitter {
     });
     this.netDbProtocol.on('searchReply', (reply, connection) => {
       this.emit('searchReply', reply, connection);
-      if (!(connection instanceof Ntcp2Connection)) return;
+      if (!isPeerConnection(connection)) return;
       for (const peer of reply.peers as Buffer[]) {
         const key = peer.toString('hex');
         if (this.netDb.get(peer) || this.pendingInfoLookups.has(key)) continue;
@@ -240,6 +298,10 @@ export class NativeRouterNode extends EventEmitter {
     if (this.started) throw new Error('Router node is already running');
     this.stopping = false;
     const address = await this.listener.start();
+    if (this.ssu2) {
+      try { this.emit('ssu2Listening', await this.ssu2.start()); }
+      catch (error) { await this.listener.stop(); throw error; }
+    }
     this.started = true;
     if (this.routerInfoRefreshMs > 0) {
       this.refreshTimer = setInterval(() => {
@@ -253,23 +315,44 @@ export class NativeRouterNode extends EventEmitter {
     return address;
   }
 
-  async connectPeer(identityHash: Buffer): Promise<Ntcp2Connection> {
+  async connectPeer(identityHash: Buffer): Promise<PeerConnection> {
     if (!this.isRunning) throw new Error('Router node is not running');
     if (!Buffer.isBuffer(identityHash) || identityHash.length !== 32) throw new Error('Peer identity hash must be 32 bytes');
     if (identityHash.equals(this.identity.identityHash)) throw new Error('Cannot connect to self');
     const key = identityHash.toString('hex');
     const existing = this.peers.get(key);
     if (existing && !existing.isClosed) return existing;
+    const inbound = this.inboundPeers.get(key);
+    if (inbound && !inbound.isClosed) return inbound;
     const pending = this.connecting.get(key);
     if (pending) return pending;
     if (this.peers.size + this.connecting.size >= this.maxOutboundConnections) throw new Error('Outbound peer connection limit reached');
     const info = this.netDb.get(identityHash);
     if (!info) throw new Error('Peer RouterInfo is not in the verified netDb');
     const encodedInfo = Buffer.concat([info.signedData, info.signature]);
-    const operation = connectNtcp2(encodedInfo, this.identity, this.routerInfo, this.connectOptions).then(connection => {
+    const attempts: Array<() => Promise<PeerConnection>> = [];
+    const ssu2 = this.ssu2;
+    const viaSsu2 = ssu2 && hasDialableSsu2(info) ? () => ssu2.connect(encodedInfo) as Promise<PeerConnection> : undefined;
+    const viaNtcp2 = hasDialableNtcp2(info) ? () => connectNtcp2(encodedInfo, this.identity, this.routerInfo, this.connectOptions) as Promise<PeerConnection> : undefined;
+    if (this.preferSsu2) { if (viaSsu2) attempts.push(viaSsu2); if (viaNtcp2) attempts.push(viaNtcp2); }
+    else { if (viaNtcp2) attempts.push(viaNtcp2); if (viaSsu2) attempts.push(viaSsu2); }
+    if (!attempts.length) throw new Error(`Peer ${key.slice(0, 16)} has no dialable ${this.ssu2 ? 'NTCP2 or IPv4 SSU2' : 'NTCP2'} address`);
+    const dial = async (): Promise<PeerConnection> => {
+      const errors: Error[] = [];
+      for (const attempt of attempts) {
+        try { return await attempt(); }
+        catch (error) {
+          const failure = error instanceof Error ? error : new Error(String(error));
+          errors.push(failure);
+          this.emit('dialFailure', identityHash, failure);
+        }
+      }
+      throw errors.length === 1 ? errors[0]! : new AggregateError(errors, `All transports failed for ${key.slice(0, 16)}: ${errors.map(error => error.message).join('; ')}`);
+    };
+    const operation = dial().then(connection => {
       if (this.stopping) { connection.close(); throw new Error('Router node stopped while peer connection was opening'); }
       this.peers.set(key, connection); this.netDbProtocol.attach(connection);
-      connection.once('close', () => this.peers.delete(key));
+      connection.once('close', () => { if (this.peers.get(key) === connection) this.peers.delete(key); });
       void this.netDbProtocol.announceLocalRouterInfo(connection).catch(error => this.emit('netDbError', error));
       this.profiles.recordSuccess(identityHash);
       this.emit('peer', identityHash, connection, 'outbound');
@@ -282,11 +365,17 @@ export class NativeRouterNode extends EventEmitter {
     return operation;
   }
 
+  /** True when this node can open a direct session to the router (NTCP2, or SSU2 when enabled). */
+  isDialable(info: RouterInfo): boolean {
+    return hasDialableNtcp2(info) || (this.ssu2 !== undefined && hasDialableSsu2(info));
+  }
+
   refreshRouterInfo(): void {
     if (!this.isRunning) throw new Error('Router node is not running');
     const current = parseRouterInfo(this.routerInfo);
     const refreshed = createRouterInfoRecord(this.identity, Date.now(), current.addresses, current.options);
     this.listener.updateRouterInfo(refreshed);
+    this.ssu2?.updateRouterInfo(refreshed);
     this.routerInfo = Buffer.from(refreshed);
     this.netDbProtocol.updateLocalRouterInfo(refreshed);
     for (const connection of this.peers.values()) void this.netDbProtocol.announceLocalRouterInfo(connection).catch(error => this.emit('netDbError', error));
@@ -303,7 +392,7 @@ export class NativeRouterNode extends EventEmitter {
 
   private readonly pendingLookups = new Map<string, { key: Buffer; tag: Buffer; resolve: (ls: LeaseSet2) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
 
-  /** Selects distinct, fresh ECIES routers with a direct NTCP2 address from the verified netDb. */
+  /** Selects distinct, fresh ECIES routers with a dialable NTCP2 or (when enabled) IPv4 SSU2 address. */
   selectOutboundTunnelPath(hopCount: number, excludedIdentityHashes: readonly Buffer[] = []): Buffer[] {
     if (!Number.isSafeInteger(hopCount) || hopCount < 1 || hopCount > 8) throw new RangeError('Outbound path length must be 1..8');
     const excluded = new Set<string>([this.identity.identityHash.toString('hex')]);
@@ -317,17 +406,12 @@ export class NativeRouterNode extends EventEmitter {
       if (info.signatureType !== 7 || info.identity.length !== 391 || info.identity[384] !== 5 || info.identity.readUInt16BE(389) !== 4) return false;
       const age = now - info.published;
       if (age > 24 * 60 * 60 * 1000 || age < -15 * 60 * 1000) return false;
-      return info.addresses.some(address => {
-        if (!['NTCP2', 'NTCP'].includes(address.transport) || (address.expiration !== 0 && address.expiration <= now)) return false;
-        const options = address.options;
-        const port = Number(options.get('port'));
-        return Boolean(options.get('host')) && Boolean(options.get('s')) && Boolean(options.get('i'))
-          && options.get('v')?.split(',').includes('2') === true && Number.isInteger(port) && port >= 1 && port <= 65535;
-      });
+      if (!acceptsShortTunnelBuilds(info)) return false;
+      return hasDialableNtcp2(info, now) || (this.ssu2 !== undefined && hasDialableSsu2(info, now));
     });
     const usable = candidates.filter(info => !this.profiles.isUnusable(info.identityHash));
     const pool = usable.length >= hopCount ? usable : candidates;
-    if (pool.length < hopCount) throw new Error(`Only ${pool.length} eligible NTCP2 routers are available; ${hopCount} are required`);
+    if (pool.length < hopCount) throw new Error(`Only ${pool.length} eligible ${this.ssu2 ? 'NTCP2/SSU2' : 'NTCP2'} routers are available; ${hopCount} are required`);
     const ranked = this.profiles.rank(pool.map(info => info.identityHash));
     return ranked.slice(0, hopCount).map(hash => Buffer.from(hash));
   }
@@ -345,15 +429,11 @@ export class NativeRouterNode extends EventEmitter {
     const floodfills = this.netDb.all().filter(info => (info.options.get('caps') ?? '').includes('f') && !info.identityHash.equals(this.identity.identityHash));
     const pool = floodfills.length ? floodfills : this.netDb.all().filter(info => !info.identityHash.equals(this.identity.identityHash));
     if (!pool.length) throw new Error('No floodfill or peer is available for a netDb lookup');
-    pool.sort((a, b) => {
-      for (let index = 0; index < 32; index++) {
-        const left = a.identityHash[index]! ^ target[index]!;
-        const right = b.identityHash[index]! ^ target[index]!;
-        if (left !== right) return left - right;
-      }
-      return 0;
-    });
-    return pool.slice(0, Math.min(count, pool.length)).map(info => Buffer.from(info.identityHash));
+    // Floodfills are responsible for the daily routing key, not the raw hash.
+    const key = routingKey(target);
+    const usable = pool.filter(info => !this.profiles.isUnusable(info.identityHash));
+    const ranked = (usable.length >= count ? usable : pool).sort((a, b) => compareXorDistance(key, a.identityHash, b.identityHash));
+    return ranked.slice(0, Math.min(count, ranked.length)).map(info => Buffer.from(info.identityHash));
   }
 
   selectFloodfill(target: Buffer): Buffer {
@@ -423,6 +503,9 @@ export class NativeRouterNode extends EventEmitter {
       identityHash: this.identity.identityHash.toString('base64'),
       destination: encodeDestinationBase64(this.destinations.local.destination),
       peers: this.peers.size,
+      ntcp2Peers: [...this.peers.values()].filter(peer => peer.transport === 'NTCP2').length,
+      ssu2Peers: [...this.peers.values()].filter(peer => peer.transport === 'SSU2').length,
+      ssu2Listening: this.ssu2?.listening ?? false,
       netDb: this.netDb.size,
     inboundTunnels: this.tunnelPool.inbound.length,
     outboundTunnels: this.tunnelPool.outbound.length,
@@ -579,14 +662,40 @@ export class NativeRouterNode extends EventEmitter {
       encryptedReply: { key: replyKey, tag: replyTag },
     });
     const lookup: I2npMessage = { type: 2, id: randomInt(1, 0x1_0000_0000), expiration: Date.now() + 60_000, payload };
-    await this.sendToFloodfill(outbound, floodfill, lookup);
-    return new Promise<LeaseSet2>((resolve, reject) => {
+    const tagKey = replyTag.toString('hex');
+    // Register before sending: a fast (loopback) reply must find the pending entry.
+    const reply = new Promise<LeaseSet2>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pendingLookups.delete(replyTag.toString('hex'));
-        reject(new Error('LeaseSet lookup timed out'));
+        this.pendingLookups.delete(tagKey);
+        reject(new Error(`LeaseSet lookup timed out at floodfill ${floodfill.toString('hex').slice(0, 16)}`));
       }, Math.max(1, timeoutMs));
-      this.pendingLookups.set(replyTag.toString('hex'), { key: replyKey, tag: replyTag, resolve, reject, timer });
+      this.pendingLookups.set(tagKey, { key: replyKey, tag: replyTag, resolve, reject, timer });
     });
+    this.emit('lookupSent', { key: destinationHash, floodfill, outbound: outbound.gatewayIdentityHash, replyGateway: from, replyTunnelId: inbound?.gatewayTunnelId });
+    try { await this.sendToFloodfill(outbound, floodfill, lookup); }
+    catch (error) {
+      const pending = this.pendingLookups.get(tagKey);
+      if (pending) { clearTimeout(pending.timer); this.pendingLookups.delete(tagKey); }
+      reply.catch(() => undefined);
+      throw error;
+    }
+    return reply;
+  }
+
+  /**
+   * A router-delivery clove addressed to this router (e.g. we are the OBEP of our own outbound
+   * tunnel and also the gateway of the inbound tunnel being built). Process it as if it had
+   * arrived on a direct connection instead of dropping it.
+   */
+  private deliverToSelf(message: I2npMessage): void {
+    if (message.type === 11 && (this.tryEncryptedLookupReply(message) || this.destinations.handleGarlic(message))) return;
+    const self = Object.assign(new EventEmitter(), {
+      transport: 'NTCP2' as const, remoteIdentityHash: this.identity.identityHash, isClosed: false,
+      sendI2np: async () => undefined, close: () => undefined,
+    }) as PeerConnection;
+    void this.transitTunnels.handleMessage(self, message).then(handled => {
+      if (!handled && !this.dispatchLocalI2np(message)) this.emit('tunnelMessage', message);
+    }).catch(error => this.emit('tunnelError', error));
   }
 
   private dispatchLocalI2np(message: I2npMessage): boolean {
@@ -693,7 +802,8 @@ export class NativeRouterNode extends EventEmitter {
   }
 
   private async bootstrapPeers(): Promise<number> {
-    const candidates = this.netDb.all().filter(info => !info.identityHash.equals(this.identity.identityHash) && !this.peers.has(info.identityHash.toString('hex')));
+    const candidates = this.netDb.all().filter(info => !info.identityHash.equals(this.identity.identityHash)
+      && !this.peers.has(info.identityHash.toString('hex')) && this.isDialable(info));
     for (let index = candidates.length - 1; index > 0; index--) {
       const other = randomInt(index + 1); [candidates[index], candidates[other]] = [candidates[other]!, candidates[index]!];
     }
@@ -721,7 +831,10 @@ export class NativeRouterNode extends EventEmitter {
     if (this.refreshTimer) clearInterval(this.refreshTimer);
     this.refreshTimer = undefined;
     await this.listener.stop();
+    if (this.ssu2) await this.ssu2.stop();
     for (const connection of this.peers.values()) connection.close();
+    for (const connection of this.inboundPeers.values()) connection.close();
+    this.inboundPeers.clear();
     this.peers.clear(); this.netDbProtocol.stop(); this.tunnelPool.stop(); this.transitTunnels.stop();
     this.tester.stop(); this.outboundLimiter.stop();
     for (const timer of this.pendingInfoLookups.values()) clearTimeout(timer);
@@ -774,10 +887,16 @@ export class NativeRouterNode extends EventEmitter {
     return undefined;
   }
 
-  private onInbound(connection: Ntcp2Connection): void {
+  private onInbound(connection: PeerConnection): void {
     if (this.stopping) { connection.close(); return; }
     this.netDbProtocol.attach(connection);
     void this.netDbProtocol.announceLocalRouterInfo(connection).catch(error => this.emit('netDbError', error));
+    const remote = connection.remoteIdentityHash;
+    if (remote) {
+      const key = remote.toString('hex');
+      this.inboundPeers.set(key, connection);
+      connection.once('close', () => { if (this.inboundPeers.get(key) === connection) this.inboundPeers.delete(key); });
+    }
     connection.once('close', () => this.emit('peerClosed', connection));
     this.emit('peer', connection.remoteIdentityHash, connection, 'inbound');
   }

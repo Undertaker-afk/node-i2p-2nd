@@ -115,24 +115,15 @@ export class TunnelPool extends EventEmitter {
     this.maintaining = true;
     try {
       this.expire();
-      const reply = this.inbound[0] ?? this.zeroHopReply();
+      // Exploratory tunnels first: netDb lookups (LeaseSet for the first destination) depend on them.
+      // Once any inbound tunnel exists, later outbound builds reply through it instead of the zero-hop gateway.
+      const reply = (): { gatewayIdentityHash: Buffer; gatewayTunnelId: number } => {
+        const inbound = this.inbound[0] ?? this.exploratoryInbound[0];
+        return inbound ? { gatewayIdentityHash: inbound.gatewayIdentityHash, gatewayTunnelId: inbound.gatewayTunnelId } : this.zeroHopReply();
+      };
       let changed = false;
-      while (this.outbound.length < this.outboundCount) {
-        const tunnel = await this.buildOutbound(this.hopCount, reply);
-        if (!tunnel) break;
-        this.outbound.push(tunnel);
-        this.emit('outbound', tunnel);
-        changed = true;
-      }
-      while (this.inbound.length < this.inboundCount) {
-        const tunnel = await this.buildInbound(this.hopCount, this.outbound[0]);
-        if (!tunnel) break;
-        this.inbound.push(tunnel);
-        this.emit('inbound', tunnel);
-        changed = true;
-      }
       while (this.exploratoryOutbound.length < this.exploratoryCount) {
-        const tunnel = await this.buildOutbound(this.exploratoryHopCount, reply);
+        const tunnel = await this.buildOutbound(this.exploratoryHopCount, reply());
         if (!tunnel) break;
         this.exploratoryOutbound.push(tunnel);
         this.emit('exploratoryOutbound', tunnel);
@@ -144,6 +135,20 @@ export class TunnelPool extends EventEmitter {
         if (!tunnel) break;
         this.exploratoryInbound.push(tunnel);
         this.emit('exploratoryInbound', tunnel);
+        changed = true;
+      }
+      while (this.outbound.length < this.outboundCount) {
+        const tunnel = await this.buildOutbound(this.hopCount, reply());
+        if (!tunnel) break;
+        this.outbound.push(tunnel);
+        this.emit('outbound', tunnel);
+        changed = true;
+      }
+      while (this.inbound.length < this.inboundCount) {
+        const tunnel = await this.buildInbound(this.hopCount, this.outbound[0] ?? this.exploratoryOutbound[0]);
+        if (!tunnel) break;
+        this.inbound.push(tunnel);
+        this.emit('inbound', tunnel);
         changed = true;
       }
       if (this.testPair && this.outbound[0] && this.inbound[0]) {

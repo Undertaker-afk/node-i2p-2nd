@@ -3,11 +3,13 @@ import type { Duplex } from 'node:stream';
 import { decodeI2npBlock, encodeI2npBlock, encodeNtcp2Block, type Ntcp2Block } from './blocks.ts';
 import { Ntcp2DataCipher } from './data-cipher.ts';
 import type { I2npMessage } from '../../protocol/i2np.ts';
+import type { PeerConnection } from '../peer-connection.ts';
 
 const DEFAULT_MAX_PENDING_BYTES = 4 * 1024 * 1024;
 
 /** Established NTCP2 data-phase connection; handshake construction is provided separately. */
-export class Ntcp2Connection extends EventEmitter {
+export class Ntcp2Connection extends EventEmitter implements PeerConnection {
+  readonly transport = 'NTCP2' as const;
   private closed = false;
   private pendingBytes = 0;
   private sendChain: Promise<void> = Promise.resolve();

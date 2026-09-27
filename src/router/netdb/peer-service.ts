@@ -4,7 +4,7 @@ import { encodeDatabaseStoreRouterInfo, parseDatabaseStoreRouterInfo } from './d
 import { encodeDatabaseLookup, encodeDatabaseSearchReply, parseDatabaseLookup, parseDatabaseSearchReply } from './messages.ts';
 import { parseRouterInfo, verifyRouterInfoSignature } from '../protocol/router-info.ts';
 import type { I2npMessage } from '../protocol/i2np.ts';
-import type { Ntcp2Connection } from '../transport/ntcp2/connection.ts';
+import type { PeerConnection } from '../transport/peer-connection.ts';
 import { VerifiedRouterInfoStore } from './store.ts';
 
 const I2NP_DATABASE_STORE = 1;
@@ -27,8 +27,8 @@ export class PeerNetDbService extends EventEmitter {
   readonly store: VerifiedRouterInfoStore;
   private readonly maxKnownPeers: number;
   private knownPeers = new Map<string, Buffer>();
-  private readonly connections = new Set<Ntcp2Connection>();
-  private readonly handlers = new Map<Ntcp2Connection, (message: I2npMessage) => void>();
+  private readonly connections = new Set<PeerConnection>();
+  private readonly handlers = new Map<PeerConnection, (message: I2npMessage) => void>();
   private nextMessageId = randomInt(1, 0x1_0000_0000);
 
   constructor(options: PeerServiceOptions) {
@@ -45,7 +45,7 @@ export class PeerNetDbService extends EventEmitter {
     if (!Number.isSafeInteger(this.maxKnownPeers) || this.maxKnownPeers < 1) throw new RangeError('maxKnownPeers must be a positive safe integer');
   }
 
-  addConnection(connection: Ntcp2Connection): void { this.attach(connection); }
+  addConnection(connection: PeerConnection): void { this.attach(connection); }
 
   updateLocalRouterInfo(bytes: Buffer): boolean {
     const info = parseRouterInfo(bytes);
@@ -56,7 +56,7 @@ export class PeerNetDbService extends EventEmitter {
     return inserted;
   }
 
-  removeConnection(connection: Ntcp2Connection): void {
+  removeConnection(connection: PeerConnection): void {
     this.connections.delete(connection);
     const handler = this.handlers.get(connection);
     if (handler) connection.removeListener('i2np', handler);
@@ -64,7 +64,7 @@ export class PeerNetDbService extends EventEmitter {
   }
 
   /** Attaches a protocol handler to a direct peer connection. */
-  attach(connection: Ntcp2Connection): void {
+  attach(connection: PeerConnection): void {
     if (this.handlers.has(connection)) return;
     this.connections.add(connection);
     const handler = (message: I2npMessage) => {
@@ -77,13 +77,13 @@ export class PeerNetDbService extends EventEmitter {
   }
 
   /** Announces this router's signed RouterInfo directly to a connected peer. */
-  async announceLocalRouterInfo(connection: Ntcp2Connection): Promise<void> {
+  async announceLocalRouterInfo(connection: PeerConnection): Promise<void> {
     if (!this.connections.has(connection)) this.attach(connection);
     await connection.sendI2np({ type: I2NP_DATABASE_STORE, id: this.allocateMessageId(), expiration: Date.now() + 60_000, payload: encodeDatabaseStoreRouterInfo(this.routerInfo) });
   }
 
   /** Sends a direct RouterInfo lookup to an established peer connection. */
-  async requestRouterInfo(connection: Ntcp2Connection, key: Buffer, excludedPeers: readonly Buffer[] = []): Promise<void> {
+  async requestRouterInfo(connection: PeerConnection, key: Buffer, excludedPeers: readonly Buffer[] = []): Promise<void> {
     if (!this.connections.has(connection)) this.attach(connection);
     const payload = encodeDatabaseLookup({ key, from: this.identityHash, kind: 'routerInfo', excludedPeers: [...excludedPeers] });
     await connection.sendI2np({ type: I2NP_DATABASE_LOOKUP, id: this.allocateMessageId(), expiration: Date.now() + 60_000, payload });
@@ -94,14 +94,14 @@ export class PeerNetDbService extends EventEmitter {
     this.knownPeers.clear();
   }
 
-  async explore(connection: Ntcp2Connection, key = randomBytes(32)): Promise<void> {
+  async explore(connection: PeerConnection, key = randomBytes(32)): Promise<void> {
     if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('Exploration key must be a 32-byte hash');
     if (!this.connections.has(connection)) this.attach(connection);
     const payload = encodeDatabaseLookup({ key, from: this.identityHash, kind: 'exploration', excludedPeers: [] });
     await connection.sendI2np({ type: I2NP_DATABASE_LOOKUP, id: this.allocateMessageId(), expiration: Date.now() + 60_000, payload });
   }
 
-  private async handleMessage(connection: Ntcp2Connection, message: I2npMessage): Promise<void> {
+  private async handleMessage(connection: PeerConnection, message: I2npMessage): Promise<void> {
     switch (message.type) {
       case I2NP_DATABASE_STORE: {
         const record = parseDatabaseStoreRouterInfo(message.payload);
@@ -125,7 +125,7 @@ export class PeerNetDbService extends EventEmitter {
     }
   }
 
-  private async handleLookup(connection: Ntcp2Connection, lookup: ReturnType<typeof parseDatabaseLookup>): Promise<void> {
+  private async handleLookup(connection: PeerConnection, lookup: ReturnType<typeof parseDatabaseLookup>): Promise<void> {
     if (lookup.replyTunnelId !== undefined) {
       this.emit('unsupportedReplyRoute', lookup);
       return;
@@ -161,7 +161,7 @@ export class PeerNetDbService extends EventEmitter {
     while (this.knownPeers.size > this.maxKnownPeers) this.knownPeers.delete(this.knownPeers.keys().next().value!);
   }
 
-  private async sendDeliveryStatus(connection: Ntcp2Connection, token: number): Promise<void> {
+  private async sendDeliveryStatus(connection: PeerConnection, token: number): Promise<void> {
     const payload = Buffer.alloc(12); payload.writeUInt32BE(token, 0); payload.writeBigUInt64BE(BigInt(Date.now()), 4);
     await connection.sendI2np({ type: I2NP_DELIVERY_STATUS, id: this.allocateMessageId(), expiration: Date.now() + 60_000, payload });
   }

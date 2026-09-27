@@ -1,7 +1,7 @@
 import { randomInt, randomBytes } from 'node:crypto';
 import type { RouterIdentityKeys } from '../identity.ts';
 import type { I2npMessage } from '../protocol/i2np.ts';
-import type { Ntcp2Connection } from '../transport/ntcp2/connection.ts';
+import type { PeerConnection } from '../transport/peer-connection.ts';
 import { TransitTunnelService } from './transit.ts';
 import {
   decryptShortTunnelBuildReplyRecord, encodeShortBuildRequestPlaintext,
@@ -42,7 +42,7 @@ export type BuiltInboundTunnel = {
 export type ShortTunnelBuildCreatorOptions = {
   identity: RouterIdentityKeys;
   transitTunnels: TransitTunnelService;
-  connectPeer: (identityHash: Buffer) => Promise<Ntcp2Connection>;
+  connectPeer: (identityHash: Buffer) => Promise<PeerConnection>;
   replyTimeoutMs?: number;
   maxConcurrentBuilds?: number;
   messageId?: () => number;
@@ -53,7 +53,7 @@ export type ShortTunnelBuildCreatorOptions = {
 export class ShortTunnelBuildCreator {
   private readonly identity: RouterIdentityKeys;
   private readonly transitTunnels: TransitTunnelService;
-  private readonly connectPeer: (identityHash: Buffer) => Promise<Ntcp2Connection>;
+  private readonly connectPeer: (identityHash: Buffer) => Promise<PeerConnection>;
   private readonly replyTimeoutMs: number;
   private readonly maxConcurrentBuilds: number;
   private activeBuilds = 0;

@@ -2,7 +2,7 @@ import { createHash, randomInt } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import type { RouterIdentityKeys } from '../identity.ts';
 import type { I2npMessage } from '../protocol/i2np.ts';
-import type { Ntcp2Connection } from '../transport/ntcp2/connection.ts';
+import type { PeerConnection } from '../transport/peer-connection.ts';
 import { processTunnelDataLayer, removeTunnelDataLayer } from './data.ts';
 import { decodeTunnelDataPayload, decodeTunnelGatewayPayload, encodeTunnelDataPayload, encodeTunnelGatewayPayload } from './messages.ts';
 import { unwrapEciesExistingSessionGarlicMessage, unwrapEciesRouterGarlicMessage, wrapEciesExistingSessionGarlicMessage } from './garlic.ts';
@@ -48,7 +48,7 @@ type OutboundEndpoint = {
 };
 export type TransitTunnelServiceOptions = {
   identity: RouterIdentityKeys;
-  connectPeer: (identityHash: Buffer) => Promise<Ntcp2Connection>;
+  connectPeer: (identityHash: Buffer) => Promise<PeerConnection>;
   maxTunnels?: number;
   allowTransit?: boolean;
 };
@@ -56,7 +56,7 @@ export type TransitTunnelServiceOptions = {
 /** Handles ECIES Short Tunnel Build participation and forwards established AES tunnel messages. */
 export class TransitTunnelService extends EventEmitter {
   readonly identity: RouterIdentityKeys;
-  private readonly connectPeer: (identityHash: Buffer) => Promise<Ntcp2Connection>;
+  private readonly connectPeer: (identityHash: Buffer) => Promise<PeerConnection>;
   private readonly maxTunnels: number;
   private readonly allowTransit: boolean;
   private readonly tunnels = new Map<number, TransitTunnel>();
@@ -168,7 +168,7 @@ export class TransitTunnelService extends EventEmitter {
     return true;
   }
 
-  async handleMessage(connection: Ntcp2Connection, message: I2npMessage): Promise<boolean> {
+  async handleMessage(connection: PeerConnection, message: I2npMessage): Promise<boolean> {
     if (message.type === I2NP_GARLIC) { await this.handleGarlic(connection, message); return true; }
     if (message.type === I2NP_SHORT_TUNNEL_BUILD) {
       if (this.inboundBuildReplies.has(message.id >>> 0)) {
@@ -196,7 +196,7 @@ export class TransitTunnelService extends EventEmitter {
     this.reassembler.clear(); this.replay.clear();
   }
 
-  private async handleGarlic(connection: Ntcp2Connection, message: I2npMessage): Promise<void> {
+  private async handleGarlic(connection: PeerConnection, message: I2npMessage): Promise<void> {
     this.expireBuildReplies(Date.now());
     if (message.payload.length >= 12) {
       const tag = message.payload.subarray(4, 12).toString('hex');
@@ -232,7 +232,7 @@ export class TransitTunnelService extends EventEmitter {
     }
   }
 
-  private async handleBuildRequest(connection: Ntcp2Connection, message: I2npMessage): Promise<void> {
+  private async handleBuildRequest(connection: PeerConnection, message: I2npMessage): Promise<void> {
     const upstreamIdentityHash = connection.remoteIdentityHash;
     if (!upstreamIdentityHash) { this.emit('buildRejected', 'peer identity unavailable', message); return; }
     let records: Buffer[];
@@ -281,7 +281,7 @@ export class TransitTunnelService extends EventEmitter {
       }
       return;
     }
-    let downstream: Ntcp2Connection;
+    let downstream: PeerConnection;
     try { downstream = await this.connectPeer(request.nextIdentityHash); }
     catch (error) {
       request.replyKey.fill(0); request.handshakeHash.fill(0); request.layerKey.fill(0); request.ivKey.fill(0);
@@ -427,7 +427,7 @@ export class TransitTunnelService extends EventEmitter {
     catch (error) { this.emit('tunnelError', error); return; }
     this.expireTunnels(Date.now());
     if (this.zeroHopInbounds.has(gateway.tunnelId)) {
-      const synthetic = { remoteIdentityHash: this.identity.identityHash, isClosed: false, sendI2np: async () => undefined } as unknown as Ntcp2Connection;
+      const synthetic = { remoteIdentityHash: this.identity.identityHash, isClosed: false, sendI2np: async () => undefined } as unknown as PeerConnection;
       await this.handleMessage(synthetic, gateway.message);
       return;
     }
