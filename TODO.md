@@ -152,12 +152,12 @@ The project will be implemented in TypeScript from scratch. It will not delegate
 - [ ] 126. Verify tunnel participant behavior against independent routers; current behavior is only locally simulated.
 - [ ] 127. Add bounded retries/cancellation to tunnel creation. (Current creator times out but does not retry.)
 - [ ] 128. Complete peer selection from fresh, verified records. (Partial: a randomized path selector filters fresh ECIES RouterInfos with usable NTCP2 metadata.)
-- [ ] 129. Add peer profile/suitability checks and automatically exclude recently failing peers. (Only caller-supplied exclusions exist.)
+- [x] 129. Add peer profile/suitability checks and automatically exclude recently failing peers.
 - [ ] 130. Complete tunnel-build resource limits. (Creator now bounds concurrent builds to a configurable 1..256 via `--max-concurrent-tunnel-builds`; global rate/CPU/memory quotas remain.)
 - [ ] 131. Implement full teardown and cleanup after partial construction. (Partial: transient crypto and route state are cleaned on current failure paths.)
 - [ ] 132. Complete forwarding backpressure and queue/resource controls. (Current sends await writes; no explicit bounded per-tunnel queue exists.)
 - [ ] 133. Verify loop/duplicate handling against protocol rules. (A bounded replay cache exists; broader loop handling remains unverified.)
-- [ ] 134. Add tunnel latency and failure metrics without peer-sensitive data.
+- [x] 134. Add tunnel latency and failure metrics without peer-sensitive data.
 - [ ] 135. Implement congestion-aware selection only if the specification supports it.
 - [ ] 136. Complete tests for build success, rejection, timeout, and peer disconnect. (Success/rejection/timeout and simulated forwarding are covered; disconnect coverage remains.)
 - [ ] 137. Fuzz tunnel message parsers and state transitions.
@@ -177,7 +177,7 @@ The project will be implemented in TypeScript from scratch. It will not delegate
 - [ ] 148. Limit nested message depth and aggregate decoded size.
 - [ ] 149. Prevent parser recursion and resource exhaustion attacks.
 - [ ] 150. Add replay handling where required by the protocol.
-- [ ] 151. Implement delivery status handling and timeout semantics.
+- [x] 151. Implement delivery status handling and timeout semantics.
 - [ ] 152. Add tests for malformed, nested, expired, and replayed messages.
 - [ ] 153. Add fixtures interoperable with reference router implementations.
 - [ ] 154. Ensure logs redact message payloads and destination secrets.
@@ -214,10 +214,10 @@ The project will be implemented in TypeScript from scratch. It will not delegate
 ## SAM and local client APIs
 
 - [ ] 181. Keep the existing SAM client API behavior covered while router APIs evolve.
-- [ ] 182. Implement a SAM server only after the router stream subsystem exists.
+- [x] 182. Implement a SAM server only after the router stream subsystem exists.
 - [ ] 183. Negotiate supported SAM versions accurately.
 - [ ] 184. Implement SAM session create, remove, and status semantics.
-- [ ] 185. Implement stream connect and accept against actual router destinations.
+- [x] 185. Implement stream connect and accept against actual router destinations.
 - [ ] 186. Implement datagram APIs only if their protocol behavior is supported.
 - [ ] 187. Validate all SAM commands and prevent command injection.
 - [ ] 188. Enforce authentication or loopback-only access for local APIs.
@@ -237,13 +237,13 @@ The project will be implemented in TypeScript from scratch. It will not delegate
 ## HTTP proxy and user-facing tools
 
 - [ ] 201. Maintain the existing HTTP proxy as a client of the SAM layer.
-- [ ] 202. Keep proxy bind default restricted to loopback.
-- [ ] 203. Validate absolute proxy URLs and reject clearnet targets.
+- [x] 202. Keep proxy bind default restricted to loopback.
+- [x] 203. Validate absolute proxy URLs and reject clearnet targets.
 - [ ] 204. Correctly preserve request methods, paths, headers, and streaming bodies.
 - [ ] 205. Handle upstream error and timeout paths without leaking sockets.
 - [ ] 206. Add limits for header sizes and concurrent proxy requests.
 - [ ] 207. Reject unsupported URL schemes clearly.
-- [ ] 208. Implement CONNECT tunneling only through real SAM streams.
+- [x] 208. Implement CONNECT tunneling only through real SAM streams.
 - [ ] 209. Add proxy tests with fake SAM and local HTTP fixtures.
 - [ ] 210. Add CLI validation for ports, hostnames, and storage paths.
 - [ ] 211. Add version and diagnostic subcommands.

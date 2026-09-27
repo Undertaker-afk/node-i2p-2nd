@@ -8,9 +8,9 @@ import { preprocessOutboundTunnelMessage, processTunnelDataLayer, removeTunnelDa
 import { buildTunnelMessageFragments, parseTunnelMessageFragment } from '../src/router/tunnel/fragments.ts';
 import { decodeTunnelDataPayload, decodeTunnelGatewayPayload, encodeTunnelDataPayload, encodeTunnelGatewayPayload } from '../src/router/tunnel/messages.ts';
 import {
-  decryptShortTunnelBuildReplyRecord, encodeShortBuildRequestPlaintext,
+  chachaShortBuildRecord, decryptShortTunnelBuildReplyRecord, encodeShortBuildRequestPlaintext,
   encryptShortBuildRequestRecord, parseShortBuildReplyPlaintext, parseShortTunnelBuildPayload,
-  transformShortBuildReplyCoverRecords,
+  preprocessShortBuildRequestRecords, transformShortBuildReplyCoverRecords,
 } from '../src/router/tunnel/short-build.ts';
 import { TransitTunnelService } from '../src/router/tunnel/transit.ts';
 import { unwrapEciesExistingSessionGarlicMessage, wrapEciesExistingSessionGarlicMessage } from '../src/router/tunnel/garlic.ts';
@@ -54,8 +54,8 @@ test('transit forwards a short build, unwraps its reply, and routes tunnel messa
   const forwardedRecords = parseShortTunnelBuildPayload(downstream.sent[0]!.payload);
   const ownReply = decryptShortTunnelBuildReplyRecord(forwardedRecords[1]!, 1, encryptedBuildRecord.replyKey, encryptedBuildRecord.handshakeHash);
   assert.equal(parseShortBuildReplyPlaintext(ownReply).returnCode, 0);
-  assert.deepEqual(forwardedRecords[0], cover);
-  assert.deepEqual(forwardedRecords[2], futureRecord.bytes);
+  assert.deepEqual(forwardedRecords[0], chachaShortBuildRecord(cover, 0, encryptedBuildRecord.replyKey));
+  assert.deepEqual(forwardedRecords[2], chachaShortBuildRecord(futureRecord.bytes, 2, encryptedBuildRecord.replyKey));
 
   const tunnelMessage = randomBytes(1024);
   await service.handleMessage(upstream.connection, { type: 18, id: 18, expiration: Date.now() + 60_000, payload: encodeTunnelDataPayload(0x12345678, tunnelMessage) });
@@ -111,10 +111,11 @@ test('three-hop short build keeps downstream requests intact and returns all aut
     replyKeys.push(encrypted);
     return encrypted.bytes;
   });
+  const prepared = preprocessShortBuildRequestRecords(records, hops.map((_, index) => index), replyKeys.map(record => record.replyKey));
   const ingress = fakeConnection(creator.identityHash);
   const initialMessage: I2npMessage = {
     type: 25, id: 0x920, expiration: Date.now() + 60_000,
-    payload: Buffer.concat([Buffer.from([records.length]), ...records]),
+    payload: Buffer.concat([Buffer.from([prepared.length]), ...prepared]),
   };
   await serviceA.handleMessage(ingress.connection, initialMessage);
   assert.equal(toB.sent.length, 1);
@@ -122,7 +123,6 @@ test('three-hop short build keeps downstream requests intact and returns all aut
   assert.equal(afterA.type, 25);
   const recordsAtB = parseShortTunnelBuildPayload(afterA.payload);
   assert.deepEqual(recordsAtB[1], records[1]);
-  assert.deepEqual(recordsAtB[2], records[2]);
   await serviceB.handleMessage(fakeConnection(hopA.identityHash).connection, afterA);
   assert.equal(toEndpoint.sent.length, 1);
   const afterB = toEndpoint.sent[0]!;
@@ -135,11 +135,11 @@ test('three-hop short build keeps downstream requests intact and returns all aut
   const replyTag = replyKeys[2]!.garlicReplyTag!;
   const garlic = unwrapEciesExistingSessionGarlicMessage(routed.message, replyKeys[2]!.garlicReplyKey!, replyTag);
   assert.equal(garlic.type, 26);
-  const endpointReplies = parseShortTunnelBuildPayload(garlic.payload);
-  const plainReplies = transformShortBuildReplyCoverRecords(endpointReplies, 2, replyKeys[2]!.replyKey);
-  for (let index = 0; index < hops.length; index++) {
-    const response = decryptShortTunnelBuildReplyRecord(plainReplies[index]!, index, replyKeys[index]!.replyKey, replyKeys[index]!.handshakeHash);
+  let peeled = parseShortTunnelBuildPayload(garlic.payload);
+  for (let index = hops.length - 1; index >= 0; index--) {
+    const response = decryptShortTunnelBuildReplyRecord(peeled[index]!, index, replyKeys[index]!.replyKey, replyKeys[index]!.handshakeHash);
     assert.equal(parseShortBuildReplyPlaintext(response).returnCode, 0);
+    peeled = transformShortBuildReplyCoverRecords(peeled, index, replyKeys[index]!.replyKey);
   }
   const appMessage: I2npMessage = { type: 20, id: 0x930, expiration: Date.now() + 30_000, payload: Buffer.from('three-hop outbound') };
   const [clearFrame] = buildTunnelMessageFragments(appMessage, { type: 'local' });
@@ -156,7 +156,6 @@ test('three-hop short build keeps downstream requests intact and returns all aut
   await serviceEndpoint.handleMessage(fakeConnection(hopB.identityHash).connection, atEndpoint);
   assert.deepEqual(await delivered, appMessage);
   clearFrame.fill(0); gatewayFrame.fill(0);
-  for (const record of plainReplies) record.fill(0);
   serviceA.stop(); serviceB.stop(); serviceEndpoint.stop();
 });
 
