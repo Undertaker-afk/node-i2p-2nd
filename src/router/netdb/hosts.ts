@@ -17,6 +17,9 @@ export const BOOTSTRAP_HOSTS: Record<string, string> = {
 
 BOOTSTRAP_HOSTS['i2p-project.i2p'] = BOOTSTRAP_HOSTS['i2p-projekt.i2p']!;
 
+/** Jump services used when a hostname is missing from the local hosts book. */
+export const JUMP_HOSTS = ['i2pjump.i2p', 'notbob.i2p'] as const;
+
 /** Default address-book subscription URLs, in fetch order. */
 export const ADDRESS_BOOK_SUBSCRIPTIONS = [
   { host: 'i2p-projekt.i2p', path: '/hosts.txt' },

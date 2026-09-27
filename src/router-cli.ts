@@ -15,6 +15,8 @@ import { createNativeSocksProxy } from './router/native-socks.ts';
 import { createRouterConsole } from './router/console.ts';
 import { parseTunnelsConf, startTunnelServices } from './router/tunnels-conf.ts';
 import { encodeDestinationBase64 } from './router/protocol/destination.ts';
+import { createI2cpServer } from './router/i2cp.ts';
+import { createI2pControlServer } from './router/i2pcontrol.ts';
 
 function usage(): string {
   return [
@@ -33,9 +35,15 @@ function usage(): string {
     '  --console-port <port> Local status page (default: 7070)',
     '  --tunnels <path>     i2pd-style tunnels.conf',
     '  --floodfill          Publish floodfill caps and answer netDb lookups',
+    '  --outproxy <host>    HTTP outproxy eepsite for clearnet URLs',
+    '  --hop-count <n>      Client tunnel hop count (default: 2)',
+    '  --i2cp-port <port>   I2CP listen port (default: 7654)',
+    '  --i2pcontrol-port <port> I2PControl JSON-RPC port (default: 7650)',
     '  --no-proxy            Do not start the native HTTP proxy',
     '  --no-socks            Do not start the SOCKS proxy',
     '  --no-console          Do not start the status page',
+    '  --no-i2cp             Do not start I2CP',
+    '  --no-i2pcontrol       Do not start I2PControl',
     '  --no-transit          Decline new transit tunnel builds',
     '  --help                Show this help',
     '',
@@ -51,7 +59,7 @@ function parseArgs(argv: string[]): Map<string, string | true> {
     const equals = argument.indexOf('=');
     const key = equals < 0 ? argument.slice(2) : argument.slice(2, equals);
     if (!/^[a-z][a-z-]*$/.test(key) || result.has(key)) throw new Error(`Invalid or duplicate option: ${argument}`);
-    if (key === 'help' || key === 'no-transit' || key === 'no-proxy' || key === 'no-socks' || key === 'no-console' || key === 'floodfill') {
+    if (key === 'help' || key === 'no-transit' || key === 'no-proxy' || key === 'no-socks' || key === 'no-console' || key === 'floodfill' || key === 'no-i2cp' || key === 'no-i2pcontrol') {
       result.set(key, true); continue;
     }
     const value = equals < 0 ? argv[++index] : argument.slice(equals + 1);
@@ -87,6 +95,10 @@ async function main(): Promise<void> {
   if (typeof stateValue !== 'string') throw new Error('--state-dir must be a path');
   const stateDir = path.resolve(stateValue);
   const floodfill = args.has('floodfill');
+  const hopCount = Number(args.get('hop-count') ?? 2);
+  if (!Number.isInteger(hopCount) || hopCount < 1 || hopCount > 7) throw new RangeError('--hop-count must be 1..7');
+  const outproxy = args.get('outproxy');
+  if (outproxy !== undefined && (typeof outproxy !== 'string' || !outproxy.endsWith('.i2p'))) throw new Error('--outproxy must be an .i2p hostname');
 
   const identity = await loadOrCreateRouterIdentity(stateDir);
   const destination = await loadOrCreateDestinationKeys(stateDir);
@@ -106,7 +118,7 @@ async function main(): Promise<void> {
   ]));
   const nodeOptions = {
     identity, routerInfo, netDb, host: bindHost, port, publishedIv, networkId, maxTransitTunnels, maxConcurrentTunnelBuilds,
-    acceptTransitTunnels: !args.has('no-transit'), destination, floodfill,
+    acceptTransitTunnels: !args.has('no-transit'), destination, floodfill, hopCount,
   };
   const node = netDb.size < 10
     ? await NativeRouterNode.createFromReseed(nodeOptions)
@@ -129,16 +141,20 @@ async function main(): Promise<void> {
   const bound = await node.start();
   process.stdout.write(`Native TypeScript I2P router listening on ${bound.address}:${bound.port}; identity ${identity.identityHash.toString('base64')}\n`);
   process.stdout.write(`Local destination ${encodeDestinationBase64(destination.destination)}\n`);
-  process.stdout.write('NTCP2, ECIES short tunnels, Garlic-N, LeaseSet2, reliable streaming, SAM, SOCKS, and address-book subscriptions are enabled.\n');
+  process.stdout.write('NTCP2, ECIES short tunnels, Garlic-N, LeaseSet2, reliable streaming, SAM, SOCKS, I2CP, and address-book subscriptions are enabled.\n');
   const sam = createNativeSamServer(node, { host: '127.0.0.1', port: 7656 });
   const samAddr = await sam.listen();
   process.stdout.write(`Native SAM v3 listening on ${samAddr.address}:${samAddr.port}\n`);
   const proxyHost = args.get('proxy-host') ?? '127.0.0.1';
   if (typeof proxyHost !== 'string' || !proxyHost.trim()) throw new Error('--proxy-host must not be empty');
-  const proxy = args.has('no-proxy') ? undefined : createNativeHttpProxy({ node, host: proxyHost, port: portArg(args, 'proxy-port', 4444) });
+  const proxy = args.has('no-proxy') ? undefined : createNativeHttpProxy({
+    node, host: proxyHost, port: portArg(args, 'proxy-port', 4444),
+    ...(typeof outproxy === 'string' ? { outproxy } : {}),
+  });
   if (proxy) {
     await proxy.listen();
-    process.stdout.write(`Native HTTP proxy listening on ${proxyHost}:${portArg(args, 'proxy-port', 4444)} (http://*.i2p only)\n`);
+    const extra = typeof outproxy === 'string' ? `outproxy ${outproxy}` : 'http://*.i2p; addresshelper enabled';
+    process.stdout.write(`Native HTTP proxy listening on ${proxyHost}:${portArg(args, 'proxy-port', 4444)} (${extra})\n`);
   }
   const socks = args.has('no-socks') ? undefined : createNativeSocksProxy({ node, host: '127.0.0.1', port: portArg(args, 'socks-port', 4447) });
   if (socks) {
@@ -149,6 +165,16 @@ async function main(): Promise<void> {
   if (consoleServer) {
     await consoleServer.listen();
     process.stdout.write(`Router console listening on 127.0.0.1:${portArg(args, 'console-port', 7070)}\n`);
+  }
+  const i2cp = args.has('no-i2cp') ? undefined : createI2cpServer(node, { host: '127.0.0.1', port: portArg(args, 'i2cp-port', 7654) });
+  if (i2cp) {
+    const addr = await i2cp.listen();
+    process.stdout.write(`Native I2CP listening on ${addr.address}:${addr.port}\n`);
+  }
+  const i2pcontrol = args.has('no-i2pcontrol') ? undefined : createI2pControlServer(node, { host: '127.0.0.1', port: portArg(args, 'i2pcontrol-port', 7650) });
+  if (i2pcontrol) {
+    await i2pcontrol.listen();
+    process.stdout.write(`I2PControl JSON-RPC listening on 127.0.0.1:${portArg(args, 'i2pcontrol-port', 7650)}\n`);
   }
   let tunnelServices: { close: () => Promise<void> } | undefined;
   const tunnelsPath = args.get('tunnels');
@@ -161,7 +187,7 @@ async function main(): Promise<void> {
     process.stdout.write(`Peer bootstrap complete: ${stats.connected} connected, ${stats.attempted} attempted\n`);
     node.tunnelPool.start();
     void node.tunnelPool.maintain().then(async () => {
-      process.stdout.write(`Tunnel pool ready: ${node.tunnelPool.inbound.length} inbound, ${node.tunnelPool.outbound.length} outbound\n`);
+      process.stdout.write(`Tunnel pool ready: ${node.tunnelPool.inbound.length} inbound, ${node.tunnelPool.outbound.length} outbound, ${node.tunnelPool.exploratoryOutbound.length} exploratory\n`);
       await node.publishLocalLeaseSet();
       process.stdout.write('Published local LeaseSet2 to floodfills\n');
       const results = await node.refreshAddressBook();
@@ -177,6 +203,8 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     if (stopping) return; stopping = true;
     if (tunnelServices) await tunnelServices.close();
+    if (i2pcontrol) await i2pcontrol.close();
+    if (i2cp) await i2cp.close();
     if (consoleServer) await consoleServer.close();
     if (socks) await socks.close();
     if (proxy) await proxy.close();

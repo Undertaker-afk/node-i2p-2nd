@@ -152,12 +152,12 @@ The project will be implemented in TypeScript from scratch. It will not delegate
 - [ ] 126. Verify tunnel participant behavior against independent routers; current behavior is only locally simulated.
 - [ ] 127. Add bounded retries/cancellation to tunnel creation. (Current creator times out but does not retry.)
 - [ ] 128. Complete peer selection from fresh, verified records. (Partial: a randomized path selector filters fresh ECIES RouterInfos with usable NTCP2 metadata.)
-- [ ] 129. Add peer profile/suitability checks and automatically exclude recently failing peers. (Only caller-supplied exclusions exist.)
+- [x] 129. Add peer profile/suitability checks and automatically exclude recently failing peers.
 - [ ] 130. Complete tunnel-build resource limits. (Creator now bounds concurrent builds to a configurable 1..256 via `--max-concurrent-tunnel-builds`; global rate/CPU/memory quotas remain.)
 - [ ] 131. Implement full teardown and cleanup after partial construction. (Partial: transient crypto and route state are cleaned on current failure paths.)
 - [ ] 132. Complete forwarding backpressure and queue/resource controls. (Current sends await writes; no explicit bounded per-tunnel queue exists.)
 - [ ] 133. Verify loop/duplicate handling against protocol rules. (A bounded replay cache exists; broader loop handling remains unverified.)
-- [ ] 134. Add tunnel latency and failure metrics without peer-sensitive data.
+- [x] 134. Add tunnel latency and failure metrics without peer-sensitive data.
 - [ ] 135. Implement congestion-aware selection only if the specification supports it.
 - [ ] 136. Complete tests for build success, rejection, timeout, and peer disconnect. (Success/rejection/timeout and simulated forwarding are covered; disconnect coverage remains.)
 - [ ] 137. Fuzz tunnel message parsers and state transitions.
@@ -177,7 +177,7 @@ The project will be implemented in TypeScript from scratch. It will not delegate
 - [ ] 148. Limit nested message depth and aggregate decoded size.
 - [ ] 149. Prevent parser recursion and resource exhaustion attacks.
 - [ ] 150. Add replay handling where required by the protocol.
-- [ ] 151. Implement delivery status handling and timeout semantics.
+- [x] 151. Implement delivery status handling and timeout semantics.
 - [ ] 152. Add tests for malformed, nested, expired, and replayed messages.
 - [ ] 153. Add fixtures interoperable with reference router implementations.
 - [ ] 154. Ensure logs redact message payloads and destination secrets.

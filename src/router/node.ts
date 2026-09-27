@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import type net from 'node:net';
-import { randomBytes, randomInt } from 'node:crypto';
+import { createHash, randomBytes, randomInt } from 'node:crypto';
 import type { RouterIdentityKeys } from './identity.ts';
 import type { I2npMessage } from './protocol/i2np.ts';
 import { VerifiedRouterInfoStore } from './netdb/store.ts';
@@ -23,6 +23,11 @@ import { encodeDatabaseStoreLeaseSet2, encodeDatabaseStoreRouterInfo, parseDatab
 import { unwrapEciesRouterGarlicMessage, wrapEciesRouterGarlicMessage } from './tunnel/garlic.ts';
 import { ADDRESS_BOOK_SUBSCRIPTIONS, HostsBook } from './netdb/hosts.ts';
 import { httpGetOverStream } from './http-client.ts';
+import { destinationBytesFromHelper, extractHelperDestination, JUMP_SERVICES } from './http-helper.ts';
+import { PeerProfiler } from './peer-profile.ts';
+import { TunnelTester } from './tunnel/test.ts';
+import { TokenBucket } from './util/rate-limit.ts';
+import { I2NP_DELIVERY_STATUS } from './protocol/delivery-status.ts';
 import { encodeTunnelGatewayPayload, encodeTunnelDataPayload } from './tunnel/messages.ts';
 import { buildTunnelMessageFragments, type TunnelDelivery } from './tunnel/fragments.ts';
 import { preprocessOutboundTunnelMessage } from './tunnel/data.ts';
@@ -47,6 +52,10 @@ export type NativeRouterNodeOptions = {
   acceptTransitTunnels?: boolean;
   destination?: DestinationKeys;
   floodfill?: boolean;
+  hopCount?: number;
+  exploratoryCount?: number;
+  outboundBytesPerSecond?: number;
+  enableJump?: boolean;
 };
 
 export type RouterStatus = {
@@ -60,6 +69,8 @@ export type RouterStatus = {
   leaseSets: number;
   floodfill: boolean;
   running: boolean;
+  exploratoryInbound: number;
+  exploratoryOutbound: number;
 };
 
 export class DatabaseSearchError extends Error {
@@ -86,7 +97,11 @@ export class NativeRouterNode extends EventEmitter {
   readonly tunnelPool: TunnelPool;
   readonly destinations: DestinationSessionManager;
   readonly hosts = new HostsBook();
+  readonly profiles = new PeerProfiler();
+  readonly tester = new TunnelTester();
   private readonly leaseSets = new Map<string, LeaseSet2>();
+  private readonly outboundLimiter: TokenBucket;
+  private readonly enableJump: boolean;
   readonly listener: Ntcp2Listener;
   private readonly connectOptions: Ntcp2ConnectOptions;
   private readonly maxOutboundConnections: number;
@@ -157,6 +172,8 @@ export class NativeRouterNode extends EventEmitter {
     this.targetOutboundPeers = options.targetOutboundPeers ?? 8;
     this.autoBootstrap = options.autoBootstrap ?? true;
     this.floodfill = options.floodfill ?? false;
+    this.enableJump = options.enableJump ?? true;
+    this.outboundLimiter = new TokenBucket(options.outboundBytesPerSecond ?? 0);
     this.routerInfoRefreshMs = options.routerInfoRefreshMs ?? 30 * 60 * 1000;
     if (!Number.isSafeInteger(this.maxOutboundConnections) || this.maxOutboundConnections < 1 || this.maxOutboundConnections > 100_000) throw new RangeError('maxOutboundConnections must be between 1 and 100000');
     if (!Number.isSafeInteger(this.targetOutboundPeers) || this.targetOutboundPeers < 0 || this.targetOutboundPeers > this.maxOutboundConnections) throw new RangeError('targetOutboundPeers must be between 0 and maxOutboundConnections');
@@ -180,6 +197,10 @@ export class NativeRouterNode extends EventEmitter {
       identity: options.identity, builder: this.shortTunnelBuilds, transit: this.transitTunnels,
       selectPath: (hopCount, excluded) => this.selectTunnelHops(hopCount, excluded),
       sendThroughOutbound: (tunnel, message, delivery) => this.sendThroughOutboundTunnel(tunnel, message, delivery),
+      hopCount: options.hopCount ?? 2,
+      exploratoryCount: options.exploratoryCount ?? 1,
+      testPair: (outbound, inbound) => this.testTunnelPair(outbound, inbound),
+      recordHop: (hash, success) => success ? this.profiles.recordSuccess(hash) : this.profiles.recordFailure(hash),
     });
     this.tunnelPool.on('change', () => {
       if (this.tunnelPool.inbound.length) void this.publishLocalLeaseSet().catch(error => this.emit('tunnelError', error));
@@ -250,8 +271,12 @@ export class NativeRouterNode extends EventEmitter {
       this.peers.set(key, connection); this.netDbProtocol.attach(connection);
       connection.once('close', () => this.peers.delete(key));
       void this.netDbProtocol.announceLocalRouterInfo(connection).catch(error => this.emit('netDbError', error));
+      this.profiles.recordSuccess(identityHash);
       this.emit('peer', identityHash, connection, 'outbound');
       return connection;
+    }).catch(error => {
+      this.profiles.recordFailure(identityHash);
+      throw error;
     }).finally(() => this.connecting.delete(key));
     this.connecting.set(key, operation);
     return operation;
@@ -300,12 +325,11 @@ export class NativeRouterNode extends EventEmitter {
           && options.get('v')?.split(',').includes('2') === true && Number.isInteger(port) && port >= 1 && port <= 65535;
       });
     });
-    for (let index = candidates.length - 1; index > 0; index--) {
-      const other = randomInt(index + 1);
-      [candidates[index], candidates[other]] = [candidates[other]!, candidates[index]!];
-    }
-    if (candidates.length < hopCount) throw new Error(`Only ${candidates.length} eligible NTCP2 routers are available; ${hopCount} are required`);
-    return candidates.slice(0, hopCount).map(info => Buffer.from(info.identityHash));
+    const usable = candidates.filter(info => !this.profiles.isUnusable(info.identityHash));
+    const pool = usable.length >= hopCount ? usable : candidates;
+    if (pool.length < hopCount) throw new Error(`Only ${pool.length} eligible NTCP2 routers are available; ${hopCount} are required`);
+    const ranked = this.profiles.rank(pool.map(info => info.identityHash));
+    return ranked.slice(0, hopCount).map(hash => Buffer.from(hash));
   }
 
   selectTunnelHops(hopCount: number, excludedIdentityHashes: readonly Buffer[] = []): ShortBuildHop[] {
@@ -400,23 +424,35 @@ export class NativeRouterNode extends EventEmitter {
       destination: encodeDestinationBase64(this.destinations.local.destination),
       peers: this.peers.size,
       netDb: this.netDb.size,
-      inboundTunnels: this.tunnelPool.inbound.length,
-      outboundTunnels: this.tunnelPool.outbound.length,
-      hosts: this.hosts.size,
-      leaseSets: this.leaseSets.size,
-      floodfill: this.floodfill,
-      running: this.isRunning,
+    inboundTunnels: this.tunnelPool.inbound.length,
+    outboundTunnels: this.tunnelPool.outbound.length,
+    exploratoryInbound: this.tunnelPool.exploratoryInbound.length,
+    exploratoryOutbound: this.tunnelPool.exploratoryOutbound.length,
+    hosts: this.hosts.size,
+    leaseSets: this.leaseSets.size,
+    floodfill: this.floodfill,
+    running: this.isRunning,
     };
   }
 
   async connectDestination(hostname: string): Promise<{ stream: Awaited<ReturnType<DestinationSessionManager['connect']>>; remote: RemoteLease }> {
+    const resolved = await this.resolveName(hostname);
+    return this.connectToHash(resolved.hash);
+  }
+
+  /** Resolves a hostname via hosts.txt, b32, or jump services. */
+  async resolveName(hostname: string, timeoutMs = 15_000): Promise<{ destination: Buffer; hash: Buffer }> {
     const resolved = this.hosts.resolve(hostname);
-    const hash = resolved?.hash;
-    if (!hash) throw new Error(`Unknown hostname ${hostname}; only .b32.i2p and hosts.txt names are resolved locally`);
-    if (resolved.destination && !this.getLeaseSet(hash)) {
-      /* destination bytes are known from hosts.txt; still need the published LeaseSet2 */
+    if (resolved?.destination) return { destination: resolved.destination, hash: resolved.hash };
+    if (resolved?.hash) {
+      const ls = this.getLeaseSet(resolved.hash) ?? await this.lookupLeaseSet(resolved.hash, timeoutMs);
+      return { destination: Buffer.from(ls.destination), hash: Buffer.from(ls.destinationHash) };
     }
-    return this.connectToHash(hash);
+    if (this.enableJump) {
+      const jumped = await this.lookupViaJump(hostname, timeoutMs);
+      if (jumped) return jumped;
+    }
+    throw new Error(`Unknown hostname ${hostname}; only .b32.i2p, hosts.txt names, and jump services are resolved`);
   }
 
   async connectToDestination(destination: Buffer): Promise<{ stream: Awaited<ReturnType<DestinationSessionManager['connect']>>; remote: RemoteLease }> {
@@ -459,6 +495,7 @@ export class NativeRouterNode extends EventEmitter {
     if (!first.identityHash.equals(tunnel.gatewayIdentityHash) || first.receiveTunnelId !== tunnel.gatewayTunnelId) throw new Error('Outbound tunnel gateway state is inconsistent');
     const frames = buildTunnelMessageFragments(message, delivery);
     try {
+      await this.outboundLimiter.take(frames.reduce((sum, frame) => sum + frame.length, 0));
       const connection = await this.connectPeer(tunnel.gatewayIdentityHash);
       if (connection.remoteIdentityHash && !connection.remoteIdentityHash.equals(tunnel.gatewayIdentityHash)) throw new Error('Outbound tunnel gateway identity mismatch');
       const layerKeys = tunnel.hops.map(({ layerKey, ivKey }) => ({ layerKey, ivKey }));
@@ -531,8 +568,8 @@ export class NativeRouterNode extends EventEmitter {
   }
 
   private async lookupLeaseSetOnce(destinationHash: Buffer, floodfill: Buffer, excludedPeers: Buffer[], timeoutMs: number): Promise<LeaseSet2> {
-    const inbound = this.tunnelPool.inbound[0];
-    const outbound = this.tunnelPool.currentOutbound();
+    const inbound = this.tunnelPool.inbound[0] ?? this.tunnelPool.exploratoryInbound[0];
+    const outbound = this.tunnelPool.exploratoryOutbound[0] ?? this.tunnelPool.currentOutbound();
     const replyKey = randomBytes(32);
     const replyTag = randomBytes(8);
     const from = inbound ? inbound.gatewayIdentityHash : this.identity.identityHash;
@@ -553,6 +590,7 @@ export class NativeRouterNode extends EventEmitter {
   }
 
   private dispatchLocalI2np(message: I2npMessage): boolean {
+    if (message.type === I2NP_DELIVERY_STATUS) return this.tester.handle(message);
     if (message.type === 11) {
       if (this.tryEncryptedLookupReply(message) || this.destinations.handleGarlic(message) || this.tryRouterGarlic(message)) return true;
     }
@@ -622,6 +660,8 @@ export class NativeRouterNode extends EventEmitter {
         if (parsed.kind === 'leaseSet2') {
           this.cacheLeaseSet(parsed.record.leaseSet);
           this.emit('leaseSet', parsed.record.leaseSet);
+        } else if (parsed.kind === 'encryptedLeaseSet') {
+          this.emit('encryptedLeaseSet', parsed.record.leaseSet);
         }
       } else if (message.type === 3) {
         const reply = parseDatabaseSearchReply(message.payload);
@@ -683,11 +723,55 @@ export class NativeRouterNode extends EventEmitter {
     await this.listener.stop();
     for (const connection of this.peers.values()) connection.close();
     this.peers.clear(); this.netDbProtocol.stop(); this.tunnelPool.stop(); this.transitTunnels.stop();
+    this.tester.stop(); this.outboundLimiter.stop();
     for (const timer of this.pendingInfoLookups.values()) clearTimeout(timer);
     this.pendingInfoLookups.clear();
     await Promise.allSettled(this.connecting.values());
     this.started = false; this.stopping = false;
     this.emit('stopped');
+  }
+
+  async addAddressHelper(hostname: string, helper: string): Promise<Buffer> {
+    const bytes = destinationBytesFromHelper(helper);
+    this.hosts.add(hostname, bytes);
+    this.emit('addressHelper', { hostname, destination: bytes });
+    return bytes;
+  }
+
+  private async testTunnelPair(outbound: BuiltOutboundTunnel, inbound: BuiltInboundTunnel): Promise<boolean> {
+    const message = this.tester.create();
+    const waiting = this.tester.wait(message.id, 8_000);
+    await this.sendThroughOutboundTunnel(outbound, message, {
+      type: 'tunnel', gatewayHash: inbound.gatewayIdentityHash, tunnelId: inbound.gatewayTunnelId,
+    });
+    const result = await waiting;
+    this.emit('tunnelTest', result);
+    return true;
+  }
+
+  private async lookupViaJump(hostname: string, timeoutMs: number): Promise<{ destination: Buffer; hash: Buffer } | undefined> {
+    for (const service of JUMP_SERVICES) {
+      const known = this.hosts.resolve(service.host);
+      if (!known?.hash) continue;
+      try {
+        const { stream } = await this.connectToHash(known.hash);
+        try {
+          const response = await httpGetOverStream(stream, {
+            host: service.host, path: service.pathFor(hostname), timeoutMs: Math.min(20_000, Math.max(1_000, timeoutMs)),
+          });
+          const location = response.headers.get('location') ?? '';
+          const helper = extractHelperDestination(location) ?? extractHelperDestination(response.body.toString('utf8'));
+          if (!helper) continue;
+          const bytes = destinationBytesFromHelper(helper);
+          this.hosts.add(hostname, bytes);
+          this.emit('addressHelper', { hostname, destination: bytes, via: service.host });
+          return { destination: Buffer.from(bytes), hash: createHash('sha256').update(bytes).digest() };
+        } finally {
+          await stream.close().catch(() => undefined);
+        }
+      } catch { continue; }
+    }
+    return undefined;
   }
 
   private onInbound(connection: Ntcp2Connection): void {

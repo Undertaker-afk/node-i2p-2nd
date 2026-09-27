@@ -82,10 +82,18 @@ export function decryptAead(key: Buffer, nonce: Buffer, aad: Buffer, ciphertextA
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
-export function chacha20Xor(key: Buffer, nonce12: Buffer, data: Buffer): Buffer {
+/** IETF ChaCha20. `counter` is the 32-bit block counter packed in the first 4 IV bytes. */
+export function chacha20(key: Buffer, nonce12: Buffer, data: Buffer, counter = 0): Buffer {
+  if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('ChaCha20 key must be 32 bytes');
+  if (!Buffer.isBuffer(nonce12) || nonce12.length !== 12) throw new Error('ChaCha20 nonce must be 12 bytes');
+  if (!Number.isInteger(counter) || counter < 0 || counter > 0xffff_ffff) throw new RangeError('ChaCha20 counter must be a uint32');
   const chachaIv = Buffer.alloc(16);
-  chachaIv.writeUInt32LE(1, 0);
+  chachaIv.writeUInt32LE(counter >>> 0, 0);
   nonce12.copy(chachaIv, 4);
   const cipher = createCipheriv('chacha20', key, chachaIv);
   return Buffer.concat([cipher.update(data), cipher.final()]);
+}
+
+export function chacha20Xor(key: Buffer, nonce12: Buffer, data: Buffer): Buffer {
+  return chacha20(key, nonce12, data, 1);
 }

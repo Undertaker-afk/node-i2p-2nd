@@ -2,6 +2,7 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 import { ByteReader } from '../protocol/common.ts';
 import { parseRouterInfo, type RouterInfo } from '../protocol/router-info.ts';
 import { parseLeaseSet2, verifyLeaseSet2, type LeaseSet2 } from '../protocol/leaseset.ts';
+import { parseEncryptedLeaseSet, verifyEncryptedLeaseSet, type EncryptedLeaseSet } from '../protocol/encrypted-leaseset.ts';
 
 export type DatabaseStoreRouterInfo = {
   key: Buffer;
@@ -57,6 +58,50 @@ export type DatabaseStoreLeaseSet2 = {
 };
 
 const DATABASE_STORE_LS2 = 3;
+const DATABASE_STORE_ENCRYPTED_LS = 5;
+
+export type DatabaseStoreEncryptedLeaseSet = {
+  key: Buffer;
+  replyToken: number;
+  replyTunnelId?: number;
+  replyGateway?: Buffer;
+  leaseSet: EncryptedLeaseSet;
+};
+
+/** Encodes an EncryptedLeaseSet DatabaseStore (type 5). */
+export function encodeDatabaseStoreEncryptedLeaseSet(encoded: Buffer, options: { replyToken?: number; replyTunnelId?: number; replyGateway?: Buffer } = {}): Buffer {
+  const record = parseEncryptedLeaseSet(encoded);
+  if (!verifyEncryptedLeaseSet(record)) throw new Error('EncryptedLeaseSet signature is invalid');
+  const replyToken = options.replyToken ?? 0;
+  const header = Buffer.concat([record.destinationHash, Buffer.from([DATABASE_STORE_ENCRYPTED_LS])]);
+  const token = Buffer.allocUnsafe(4); token.writeUInt32BE(replyToken >>> 0);
+  let routing = Buffer.alloc(0);
+  if (replyToken !== 0) {
+    if (!options.replyGateway || !Buffer.isBuffer(options.replyGateway) || options.replyGateway.length !== 32) throw new Error('DatabaseStore reply gateway is required when a reply token is set');
+    const tunnel = Buffer.allocUnsafe(4); tunnel.writeUInt32BE(options.replyTunnelId ?? 0);
+    routing = Buffer.concat([tunnel, options.replyGateway]);
+  }
+  const payload = Buffer.concat([header, token, routing, encoded]);
+  if (payload.length > 0xffff) throw new RangeError('DatabaseStore payload exceeds I2NP size limit');
+  return payload;
+}
+
+export function parseDatabaseStoreEncryptedLeaseSet(payload: Buffer): DatabaseStoreEncryptedLeaseSet {
+  const reader = new ByteReader(payload, 1_048_576);
+  const key = Buffer.from(reader.readHash());
+  const type = reader.readUInt8();
+  if (type !== DATABASE_STORE_ENCRYPTED_LS) throw new Error(`Unsupported DatabaseStore record type ${type}`);
+  const replyToken = reader.readUInt32();
+  let replyTunnelId: number | undefined;
+  let replyGateway: Buffer | undefined;
+  if (replyToken !== 0) {
+    replyTunnelId = reader.readUInt32(); replyGateway = Buffer.from(reader.readHash());
+  }
+  const leaseSet = parseEncryptedLeaseSet(Buffer.from(reader.readBytes(reader.remaining)));
+  if (!verifyEncryptedLeaseSet(leaseSet)) throw new Error('EncryptedLeaseSet signature is invalid');
+  if (!leaseSet.destinationHash.equals(key)) throw new Error('DatabaseStore key does not match EncryptedLeaseSet destination hash');
+  return { key, replyToken, ...(replyTunnelId === undefined ? {} : { replyTunnelId }), ...(replyGateway === undefined ? {} : { replyGateway }), leaseSet };
+}
 
 /** Encodes an uncompressed LeaseSet2 DatabaseStore (type 3). */
 export function encodeDatabaseStoreLeaseSet2(leaseSetBytes: Buffer, options: { replyToken?: number; replyTunnelId?: number; replyGateway?: Buffer } = {}): Buffer {
@@ -93,10 +138,11 @@ export function parseDatabaseStoreLeaseSet2(payload: Buffer): DatabaseStoreLease
   return { key, replyToken, ...(replyTunnelId === undefined ? {} : { replyTunnelId }), ...(replyGateway === undefined ? {} : { replyGateway }), leaseSet };
 }
 
-export function parseDatabaseStore(payload: Buffer): { kind: 'routerInfo'; record: DatabaseStoreRouterInfo } | { kind: 'leaseSet2'; record: DatabaseStoreLeaseSet2 } {
+export function parseDatabaseStore(payload: Buffer): { kind: 'routerInfo'; record: DatabaseStoreRouterInfo } | { kind: 'leaseSet2'; record: DatabaseStoreLeaseSet2 } | { kind: 'encryptedLeaseSet'; record: DatabaseStoreEncryptedLeaseSet } {
   if (!Buffer.isBuffer(payload) || payload.length < 33) throw new Error('DatabaseStore payload is truncated');
   const type = payload[32]!;
   if ((type & 1) === 0) return { kind: 'routerInfo', record: parseDatabaseStoreRouterInfo(payload) };
   if (type === DATABASE_STORE_LS2) return { kind: 'leaseSet2', record: parseDatabaseStoreLeaseSet2(payload) };
+  if (type === DATABASE_STORE_ENCRYPTED_LS) return { kind: 'encryptedLeaseSet', record: parseDatabaseStoreEncryptedLeaseSet(payload) };
   throw new Error(`Unsupported DatabaseStore record type ${type}`);
 }
