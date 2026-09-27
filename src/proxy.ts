@@ -24,7 +24,7 @@ export function createProxy({ sam = new SamClient(), host = '127.0.0.1', port = 
       upstream = await sam.connect(destination);
       const headers: http.OutgoingHttpHeaders = { ...req.headers, host: target.host, connection: 'close' };
       delete headers['proxy-connection']; delete headers['proxy-authorization'];
-      const outgoing = http.request({ hostname: target.hostname, port: Number(target.port || 80), method: req.method, path: `${target.pathname}${target.search}` || '/', headers, agent: false, createConnection: () => upstream! });
+      const outgoing = http.request({ hostname: target.hostname, port: Number(target.port || 80), method: req.method, path: `${target.pathname}${target.search}` || '/', headers, createConnection: () => upstream! });
       const timer = setTimeout(() => outgoing.destroy(new Error('I2P request timed out')), requestTimeoutMs);
       outgoing.once('close', () => clearTimeout(timer));
       outgoing.on('response', response => { res.writeHead(response.statusCode ?? 502, response.statusMessage, response.headers); response.pipe(res); });

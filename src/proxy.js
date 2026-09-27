@@ -12,7 +12,7 @@ function createProxy({ sam = new SamClient(), host = '0.0.0.0', port = 4444 } = 
       upstream = await sam.connect(destination);
       const headers = { ...req.headers, host: target.host, connection: 'close' };
       delete headers['proxy-connection'];
-      const outgoing = http.request({ hostname: target.hostname, port: 80, method: req.method, path: `${target.pathname}${target.search}` || '/', headers, agent: false, createConnection: () => upstream });
+      const outgoing = http.request({ hostname: target.hostname, port: 80, method: req.method, path: `${target.pathname}${target.search}` || '/', headers, createConnection: () => upstream });
       outgoing.on('response', response => { res.writeHead(response.statusCode, response.statusMessage, response.headers); response.pipe(res); });
       outgoing.on('error', e => { upstream?.destroy(); if (!res.headersSent) res.writeHead(502); res.end(`I2P stream error: ${e.message}`); });
       req.pipe(outgoing);

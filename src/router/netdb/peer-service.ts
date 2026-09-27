@@ -104,6 +104,8 @@ export class PeerNetDbService extends EventEmitter {
   private async handleMessage(connection: PeerConnection, message: I2npMessage): Promise<void> {
     switch (message.type) {
       case I2NP_DATABASE_STORE: {
+        // Only RouterInfo stores (type byte even) are handled here; LeaseSet stores go to the router node.
+        if (message.payload.length > 32 && (message.payload[32]! & 1) !== 0) { this.emit('message', connection, message); return; }
         const record = parseDatabaseStoreRouterInfo(message.payload);
         const inserted = this.store.store(record.routerInfo);
         this.rememberPeer(record.key);
@@ -111,9 +113,13 @@ export class PeerNetDbService extends EventEmitter {
         this.emit('routerInfo', record.routerInfo, inserted);
         return;
       }
-      case I2NP_DATABASE_LOOKUP:
-        await this.handleLookup(connection, parseDatabaseLookup(message.payload));
+      case I2NP_DATABASE_LOOKUP: {
+        const lookup = parseDatabaseLookup(message.payload);
+        // Tunnel-routed, encrypted-reply, and LeaseSet lookups need the router node (LeaseSet cache, tunnels).
+        if (lookup.replyTunnelId !== undefined || lookup.encryptedReply || lookup.kind === 'leaseSet') { this.emit('message', connection, message); return; }
+        await this.handleLookup(connection, lookup);
         return;
+      }
       case I2NP_DATABASE_SEARCH_REPLY: {
         const reply = parseDatabaseSearchReply(message.payload);
         for (const peer of reply.peers) this.rememberPeer(peer);

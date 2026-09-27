@@ -11,7 +11,9 @@
     "start": "node --experimental-strip-types src/cli.ts",
     "router": "node --experimental-strip-types src/router-cli.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "netcheck": "node --experimental-strip-types src/router/netcheck.ts",
+    "mininet": "node --experimental-strip-types scripts/mininet.ts"
   },
   "engines": {
     "node": ">=22.6"

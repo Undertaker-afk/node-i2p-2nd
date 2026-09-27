@@ -43,7 +43,7 @@ export class TunnelPool extends EventEmitter {
   private readonly maintainIntervalMs: number;
   private readonly testPair: TunnelPoolOptions['testPair'];
   private readonly recordHop: TunnelPoolOptions['recordHop'];
-  private maintaining = false;
+  private maintaining: Promise<void> | undefined;
   private timer: NodeJS.Timeout | undefined;
 
   constructor(options: TunnelPoolOptions) {
@@ -110,10 +110,17 @@ export class TunnelPool extends EventEmitter {
     return tunnelId;
   }
 
-  async maintain(): Promise<void> {
-    if (this.maintaining) return;
-    this.maintaining = true;
-    try {
+  /**
+   * Builds missing tunnels. Concurrent callers share the in-flight run, so awaiting maintain()
+   * after start() (which already kicked one off) really waits for the tunnels.
+   */
+  maintain(): Promise<void> {
+    if (!this.maintaining) this.maintaining = this.runMaintain().finally(() => { this.maintaining = undefined; });
+    return this.maintaining;
+  }
+
+  private async runMaintain(): Promise<void> {
+    {
       this.expire();
       // Exploratory tunnels first: netDb lookups (LeaseSet for the first destination) depend on them.
       // Once any inbound tunnel exists, later outbound builds reply through it instead of the zero-hop gateway.
@@ -160,7 +167,7 @@ export class TunnelPool extends EventEmitter {
         }
       }
       if (changed) this.emit('change');
-    } finally { this.maintaining = false; }
+    }
   }
 
   stop(): void {

@@ -174,7 +174,10 @@ export class NativeRouterNode extends EventEmitter {
       ...(options.maxConcurrentTunnelBuilds === undefined ? {} : { maxConcurrentBuilds: options.maxConcurrentTunnelBuilds }),
     });
     this.netDbProtocol.on('message', (connection, message) => {
-      void this.transitTunnels.handleMessage(connection as PeerConnection, message).catch(error => this.emit('tunnelError', error));
+      void this.transitTunnels.handleMessage(connection as PeerConnection, message).then(handled => {
+        // Direct DeliveryStatus, LeaseSet stores, tunnel-routed lookups etc. are router-local messages.
+        if (!handled && !this.dispatchLocalI2np(message)) this.emit('tunnelMessage', message);
+      }).catch(error => this.emit('tunnelError', error));
     });
     this.transitTunnels.on('tunnelError', error => this.emit('tunnelError', error));
     this.transitTunnels.on('localMessage', message => {
@@ -689,11 +692,7 @@ export class NativeRouterNode extends EventEmitter {
    */
   private deliverToSelf(message: I2npMessage): void {
     if (message.type === 11 && (this.tryEncryptedLookupReply(message) || this.destinations.handleGarlic(message))) return;
-    const self = Object.assign(new EventEmitter(), {
-      transport: 'NTCP2' as const, remoteIdentityHash: this.identity.identityHash, isClosed: false,
-      sendI2np: async () => undefined, close: () => undefined,
-    }) as PeerConnection;
-    void this.transitTunnels.handleMessage(self, message).then(handled => {
+    void this.transitTunnels.handleMessage(this.selfConnection(), message).then(handled => {
       if (!handled && !this.dispatchLocalI2np(message)) this.emit('tunnelMessage', message);
     }).catch(error => this.emit('tunnelError', error));
   }
@@ -754,12 +753,42 @@ export class NativeRouterNode extends EventEmitter {
       body.copy(payload, 4);
       reply = { type: 11, id: reply.id, expiration: reply.expiration, payload };
     }
-    const outbound = this.tunnelPool.outbound[0];
-    if (lookup.replyTunnelId && outbound) {
-      await this.sendThroughOutboundTunnel(outbound, reply, { type: 'tunnel', gatewayHash: lookup.from, tunnelId: lookup.replyTunnelId });
+    await this.sendNetDbReply(lookup.from, lookup.replyTunnelId, reply);
+  }
+
+  /**
+   * Floodfill reply delivery as on the real network: a TunnelGateway message sent directly to the
+   * reply gateway router (or the reply itself to `from` when no reply tunnel was given). Falls back
+   * to an outbound client tunnel only when the gateway cannot be dialed directly.
+   */
+  private async sendNetDbReply(to: Buffer, replyTunnelId: number | undefined, reply: I2npMessage): Promise<void> {
+    if (to.equals(this.identity.identityHash)) {
+      if (replyTunnelId) {
+        void this.transitTunnels.handleMessage(this.selfConnection(), { type: 19, id: randomInt(1, 0x1_0000_0000), expiration: reply.expiration, payload: encodeTunnelGatewayPayload(replyTunnelId, reply) })
+          .catch(error => this.emit('tunnelError', error));
+      } else this.deliverToSelf(reply);
       return;
     }
-    if (outbound) await this.sendToFloodfill(outbound, lookup.from, reply);
+    try {
+      const connection = await this.connectPeer(to);
+      if (replyTunnelId) {
+        await connection.sendI2np({ type: 19, id: randomInt(1, 0x1_0000_0000), expiration: reply.expiration, payload: encodeTunnelGatewayPayload(replyTunnelId, reply) });
+      } else await connection.sendI2np(reply);
+      return;
+    } catch (error) {
+      const outbound = this.tunnelPool.outbound[0];
+      if (!outbound) throw error;
+    }
+    const outbound = this.tunnelPool.outbound[0]!;
+    if (replyTunnelId) await this.sendThroughOutboundTunnel(outbound, reply, { type: 'tunnel', gatewayHash: to, tunnelId: replyTunnelId });
+    else await this.sendToFloodfill(outbound, to, reply);
+  }
+
+  private selfConnection(): PeerConnection {
+    return Object.assign(new EventEmitter(), {
+      transport: 'NTCP2' as const, remoteIdentityHash: this.identity.identityHash, isClosed: false,
+      sendI2np: async () => undefined, close: () => undefined,
+    }) as PeerConnection;
   }
 
   private handleNetDbReply(message: I2npMessage): void {
@@ -769,6 +798,13 @@ export class NativeRouterNode extends EventEmitter {
         if (parsed.kind === 'leaseSet2') {
           this.cacheLeaseSet(parsed.record.leaseSet);
           this.emit('leaseSet', parsed.record.leaseSet);
+          // Floodfills acknowledge stores that ask for it (publishers wait for this DeliveryStatus).
+          const { replyToken, replyGateway, replyTunnelId } = parsed.record;
+          if (this.floodfill && replyToken && replyGateway) {
+            const status = Buffer.alloc(12); status.writeUInt32BE(replyToken >>> 0, 0); status.writeBigUInt64BE(BigInt(Date.now()), 4);
+            const ack: I2npMessage = { type: I2NP_DELIVERY_STATUS, id: randomInt(1, 0x1_0000_0000), expiration: Date.now() + 60_000, payload: status };
+            void this.sendNetDbReply(replyGateway, replyTunnelId, ack).catch(error => this.emit('netDbError', error));
+          }
         } else if (parsed.kind === 'encryptedLeaseSet') {
           this.emit('encryptedLeaseSet', parsed.record.leaseSet);
         }

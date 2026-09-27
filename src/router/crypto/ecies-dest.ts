@@ -1,4 +1,4 @@
-import { createPublicKey, type KeyObject } from 'node:crypto';
+import { createPublicKey, randomInt, type KeyObject } from 'node:crypto';
 import { decodeElligator2, generateElligator2KeyPair } from './elligator2.ts';
 import {
   decryptAead, encryptAead, hkdf, mixKey, noiseNonce, rawPublicKey, sha256, x25519SharedSecret,
@@ -62,6 +62,12 @@ export function encodeDestGarlicPayload(cloves: readonly GarlicClove[], includeD
   parts.push(encodePaddingBlock());
   return Buffer.concat(parts);
 }
+
+/**
+ * Every garlic message needs a fresh I2NP message ID: gateways and routers drop repeated IDs as
+ * replays (a fixed default of 1 made every ES message after the first vanish at the inbound gateway).
+ */
+export function randomMessageId(): number { return randomInt(1, 0x1_0000_0000); }
 
 export function encodeGarlicEnvelope(body: Buffer, messageId: number, expiration: number): I2npMessage {
   if (4 + body.length > I2NP_MAX_PAYLOAD) throw new RangeError('Garlic Message exceeds I2NP payload size');
@@ -135,7 +141,7 @@ export function wrapDestNewSession(
   const nsrTagSet = createNsrTagSet(state.ck);
   const nsrTags = new Map(nsrTagSet.generateWindow(12).map(entry => [entry.tag.toString('hex'), entry]));
   const expiration = options.expiration ?? Date.now() + 60_000;
-  const messageId = options.messageId ?? 1;
+  const messageId = options.messageId ?? randomMessageId();
   return {
     message: encodeGarlicEnvelope(body, messageId, expiration),
     state, ephemeralPrivateKey: ephemeral.privateKey, ephemeralPublicKey: ephemeral.publicKey,
@@ -204,7 +210,7 @@ export function wrapDestNewSessionReply(
   const session = splitAndInitSessions(state.ck, aliceStaticPublicKey, 'bob');
   const body = Buffer.concat([tag, ephemeral.encoded, emptyCipher, payloadCipher]);
   return {
-    message: encodeGarlicEnvelope(body, options.messageId ?? 1, options.expiration ?? Date.now() + 60_000),
+    message: encodeGarlicEnvelope(body, options.messageId ?? randomMessageId(), options.expiration ?? Date.now() + 60_000),
     session,
   };
 }
@@ -246,7 +252,7 @@ export function wrapDestExistingSession(
   let ciphertext: Buffer;
   try { ciphertext = encryptAead(entry.key, noiseNonce(entry.index), entry.tag, payload); }
   finally { payload.fill(0); }
-  return encodeGarlicEnvelope(Buffer.concat([entry.tag, ciphertext]), options.messageId ?? 1, options.expiration ?? Date.now() + 60_000);
+  return encodeGarlicEnvelope(Buffer.concat([entry.tag, ciphertext]), options.messageId ?? randomMessageId(), options.expiration ?? Date.now() + 60_000);
 }
 
 export function unwrapDestExistingSession(message: I2npMessage, session: EstablishedDestSession): GarlicClove[] {

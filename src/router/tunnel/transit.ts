@@ -228,7 +228,9 @@ export class TransitTunnelService extends EventEmitter {
         this.emit('tunnelError', new Error(`Router Garlic clove delivery ${clove.delivery.type} is not handled`));
         continue;
       }
-      await this.handleMessage(connection, clove.message);
+      // Router-garlic cloves carrying netDb/DeliveryStatus messages (e.g. a DatabaseStore or DatabaseLookup
+      // sent to a floodfill) are not tunnel messages: hand them to the router like tunnel-endpoint local delivery.
+      if (!(await this.handleMessage(connection, clove.message))) this.emit('localMessage', clove.message);
     }
   }
 

@@ -171,8 +171,10 @@ export function wrapDestinationStream(stream: DestinationStream): HttpSocket {
   }) as HttpSocket;
   const onData = (payload: Buffer): void => { duplex.push(payload); };
   const onClose = (): void => { duplex.push(null); };
+  const onError = (error: Error): void => { duplex.destroy(error); };
   stream.on('data', onData);
   stream.on('close', onClose);
+  stream.on('error', onError);
   duplex.setTimeout = (ms: number, callback?: () => void) => {
     if (ms > 0 && callback) duplex.once('timeout', callback);
     return duplex;
@@ -182,6 +184,7 @@ export function wrapDestinationStream(stream: DestinationStream): HttpSocket {
   duplex.once('close', () => {
     stream.off('data', onData);
     stream.off('close', onClose);
+    stream.off('error', onError);
   });
   return duplex;
 }

@@ -100,7 +100,7 @@ export class DestinationStream extends EventEmitter {
     try {
       await this.sendPacket(createResetPacket(this.sendStreamId, this.receiveStreamId, this.nextSendSeq, this.nextRecvSeq - 1));
     } finally {
-      this.emit('error', new Error('Stream reset'));
+      this.emitError(new Error('Stream reset'));
       this.finishClose();
     }
   }
@@ -111,7 +111,7 @@ export class DestinationStream extends EventEmitter {
     this.applyAck(packet.ackThrough, packet.nacks);
     if (packet.flags & STREAM_RESET) {
       this.closed = true;
-      this.emit('error', new Error('Peer reset the stream'));
+      this.emitError(new Error('Peer reset the stream'));
       this.finishClose();
       return true;
     }
@@ -151,6 +151,11 @@ export class DestinationStream extends EventEmitter {
     }
   }
 
+  /** Stream failures must not crash the router when no consumer attached an 'error' listener. */
+  private emitError(error: Error): void {
+    if (this.listenerCount('error') > 0) this.emit('error', error);
+  }
+
   private applyAck(ackThrough: number, nacks: readonly number[]): void {
     for (const seq of [...this.unacked.keys()]) {
       if (seq <= ackThrough && !nacks.includes(seq)) this.unacked.delete(seq);
@@ -188,7 +193,7 @@ export class DestinationStream extends EventEmitter {
       if (now - entry.sentAt < this.rtoMs) continue;
       if (entry.tries >= 8) {
         this.closed = true;
-        this.emit('error', new Error(`Stream packet ${seq} timed out`));
+        this.emitError(new Error(`Stream packet ${seq} timed out`));
         this.finishClose();
         return;
       }
@@ -237,11 +242,20 @@ function leaseSetClove(leaseSetBytes: Buffer): GarlicClove {
   };
 }
 
+const MAX_RECEIVE_SESSIONS = 512;
+
 /** End-to-end ECIES sessions and streaming for one local destination. */
 export class DestinationSessionManager extends EventEmitter {
   readonly local: DestinationKeys;
   private localLeaseSet: Buffer | undefined;
+  /** Latest session per remote static key (used when sending without a stream). */
   private readonly sessions = new Map<string, EstablishedDestSession>();
+  /**
+   * Every live session, for matching incoming ES tags. Concurrent handshakes with the same remote
+   * (parallel streams) each create their own ratchet session; overwriting by remote key made the
+   * earlier stream's messages undecryptable.
+   */
+  private readonly receiveSessions = new Set<EstablishedDestSession>();
   private readonly pendingNs = new Map<string, PendingConnect>();
   private readonly streams = new Set<DestinationStream>();
   private readonly sendGarlic: (message: I2npMessage, remote: RemoteLease) => Promise<void>;
@@ -304,7 +318,7 @@ export class DestinationSessionManager extends EventEmitter {
         for (const [hex, pending] of this.pendingNs) {
           if (!pending.pending.nsrTags.has(body.subarray(0, 8).toString('hex'))) continue;
           const opened = unwrapDestNewSessionReply(message, pending.pending, this.local.encryptionPrivateKey);
-          this.sessions.set(pending.remote.encryptionPublicKey.toString('hex'), opened.session);
+          this.rememberSession(pending.remote.encryptionPublicKey, opened.session);
           this.ingestCloves(opened.cloves);
           const synAck = opened.cloves.find(clove => clove.message.type === I2NP_DATA);
           let sendStreamId = randomInt(1, 0x1_0000_0000);
@@ -322,7 +336,7 @@ export class DestinationSessionManager extends EventEmitter {
           pending.resolve(stream);
           return true;
         }
-        for (const session of this.sessions.values()) {
+        for (const session of this.receiveSessions) {
           if (!session.receiveTags.has(body.subarray(0, 8).toString('hex'))) continue;
           const cloves = unwrapDestExistingSession(message, session);
           this.dispatchCloves(cloves);
@@ -344,7 +358,7 @@ export class DestinationSessionManager extends EventEmitter {
         }
       }
       const reply = wrapDestNewSessionReply(incoming, [dataClove(remote.destinationHash, createSynAckPacket(this.local, sendStreamId, receiveStreamId))], incoming.aliceStaticPublicKey, this.local.encryptionPrivateKey);
-      this.sessions.set(incoming.aliceStaticPublicKey.toString('hex'), reply.session);
+      this.rememberSession(incoming.aliceStaticPublicKey, reply.session);
       const stream = new DestinationStream({
         session: reply.session, local: this.local, remote, sendStreamId, receiveStreamId, sendGarlic: this.sendGarlic,
       });
@@ -354,6 +368,12 @@ export class DestinationSessionManager extends EventEmitter {
     } catch {
       return false;
     }
+  }
+
+  private rememberSession(remoteStaticKey: Buffer, session: EstablishedDestSession): void {
+    this.sessions.set(remoteStaticKey.toString('hex'), session);
+    this.receiveSessions.add(session);
+    while (this.receiveSessions.size > MAX_RECEIVE_SESSIONS) this.receiveSessions.delete(this.receiveSessions.values().next().value!);
   }
 
   private ingestCloves(cloves: GarlicClove[]): void {

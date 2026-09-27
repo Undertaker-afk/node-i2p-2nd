@@ -123,7 +123,8 @@ function proxyRequest(
     method: req.method,
     path,
     headers,
-    agent: false,
+    // No `agent` option: with `agent: false` Node builds a fresh Agent whose own createConnection
+    // (net.connect + DNS) wins, so every .i2p request failed with getaddrinfo ENOTFOUND.
     createConnection: () => socket as unknown as net.Socket,
   });
   const timer = setTimeout(() => outgoing.destroy(new Error('I2P request timed out')), requestTimeoutMs);

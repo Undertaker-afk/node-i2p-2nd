@@ -152,3 +152,27 @@ test('persists destination keys across reloads', async () => {
     assert.equal((await stat(path.join(state, 'destination.json'))).mode & 0o777, 0o600);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('two streams to the same destination keep independent ratchet sessions; garlic IDs are unique', async () => {
+  let alice!: DestinationSessionManager;
+  const ids = new Set<number>();
+  let sent = 0;
+  const bob = new DestinationSessionManager({ sendGarlic: async message => { ids.add(message.id); sent++; alice.handleGarlic(message); } });
+  alice = new DestinationSessionManager({ sendGarlic: async message => { ids.add(message.id); sent++; bob.handleGarlic(message); } });
+  alice.createLeaseSet([{ gatewayHash: randomBytes(32), tunnelId: 11, expiresAtSeconds: Math.floor(Date.now() / 1000) + 600 }]);
+  let served = 0;
+  bob.on('inboundStream', (stream, nsr) => {
+    const index = ++served;
+    stream.on('data', () => { void stream.write(Buffer.from(`HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n${index}`)).then(() => stream.close()); });
+    alice.handleGarlic(nsr);
+  });
+  const remote = { gatewayHash: randomBytes(32), tunnelId: 9, encryptionPublicKey: bob.local.encryptionPublicKey, destination: bob.local.destination, destinationHash: bob.local.destinationHash };
+  const first = await alice.connect(remote);
+  const second = await alice.connect(remote);
+  // The first stream must still work after a second handshake with the same remote static key.
+  const firstResponse = await httpGetOverStream(first, { host: 'bob.i2p', path: '/a', timeoutMs: 5_000 });
+  const secondResponse = await httpGetOverStream(second, { host: 'bob.i2p', path: '/b', timeoutMs: 5_000 });
+  assert.equal(firstResponse.body.toString(), '1');
+  assert.equal(secondResponse.body.toString(), '2');
+  assert.equal(ids.size, sent, 'every garlic message gets a fresh I2NP id (gateways drop repeated ids as replays)');
+});
